@@ -61,15 +61,13 @@ if (!dir.exists(FRAG_DIR)) {
 metadata <- readr::read_csv(file.path(DATA_DIR, "sample_metadata.csv"), show_col_types = FALSE)
 metadata <- metadata %>%
   dplyr::mutate(
-    Group = factor(Group, levels = c("Ctrl", "ALS")),
-    sample_id = .data$Sample_id
+    Group = factor(Group, levels = c("Ctrl", "ALS"))
   )
 
 # Load genome
 genome <- BSgenome.Hsapiens.UCSC.hg38
 
 # Figure theme
-# Enhanced publication-quality theme for Nature-style figures
 theme_pub <- function(base_size = 14, base_family = "Helvetica") {
   theme_classic(base_size = base_size, base_family = base_family) +
     theme(
@@ -129,14 +127,6 @@ theme_pub <- function(base_size = 14, base_family = "Helvetica") {
 COLORS <- c("ALS" = "#E64B35", "Ctrl" = "#4DBBD5")
 
 # QC Functions ----
-{
-  bam_path <- file.path(RAW_DIR, metadata$Bam_file[1])
-  sample_id <- metadata$sample_id[1]
-  genome <- BSgenome.Hsapiens.UCSC.hg38
-  chunk_size = 1e6
-  frag_dir = FRAG_DIR
-}
-
 ## flagstat ----
 get_flagstat <- function(bam_path) {
   
@@ -461,6 +451,8 @@ all_metrics <- all_metrics[!sapply(all_metrics, is.null)]
 if (length(all_metrics) == 0) {
   stop("No BAM files found. Please check data/raw/ directory.")
 }
+
+saveRDS(all_metrics, file.path(DATA_DIR, "processed", "all_metrics.rds"))
 
 # Summary statistics table ----
 summary_stats <- map_dfr(all_metrics, calculate_summary_stats)

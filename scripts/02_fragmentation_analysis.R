@@ -1,7 +1,8 @@
 # 02_fragmentation_analysis.R
-#
-# Insert size / fragmentation analysis (publication-grade)
-#
+# https://www.sciencedirect.com/science/article/pii/S0009898124022861?casa_token=xJj0Aav-s0IAAAAA:Epr21Bl-R3YfswQro5bbHfV_sMgJHIDpGc2ALqO5zA_4S5AKenI-dGB6gEVBbgOs_ZqzHHZuiug
+
+# Insert size / fragmentation analysis
+
 # What this script produces:
 # - Fragment size distribution summaries (30–500 bp) + short/long fragment ratios
 # - Genome-binned fragment size coverage (short vs long) and fragmentation ratio tracks
@@ -25,8 +26,7 @@
 
 suppressPackageStartupMessages(library(ggplot2))
 suppressPackageStartupMessages(library(dplyr))
-suppressPackageStartupMessages(library(tidyr))
-suppressPackageStartupMessages(library(readr))
+suppressPackageStartupMessages(library(tidyverse))
 suppressPackageStartupMessages(library(purrr))
 suppressPackageStartupMessages(library(stringr))
 suppressPackageStartupMessages(library(tibble))
@@ -53,16 +53,14 @@ if (!dir.exists(FIG_DIR)) dir.create(FIG_DIR, recursive = TRUE, showWarnings = F
 if (!dir.exists(TABLE_DIR)) dir.create(TABLE_DIR, recursive = TRUE, showWarnings = FALSE)
 
 # Load sample metadata ----
-metadata <- readr::read_csv(file.path(DATA_DIR, "sample_metadata.csv"), show_col_types = FALSE) %>%
-  dplyr::mutate(
-    Group = factor(.data$Group, levels = c("Ctrl", "ALS")),
-    sample_id = .data$Sample_id
-  )
+metadata <- readr::read_csv(file.path(DATA_DIR, "sample_metadata.csv"), show_col_types = FALSE)
+metadata <- metadata %>%
+  dplyr::mutate(Group = factor(.data$Group, levels = c("Ctrl", "ALS")))
 
 # Genome ----
 genome <- BSgenome.Hsapiens.UCSC.hg38
 
-# Theme + palette (match scripts/01_qc_processing.R) ----
+# Theme + palette ----
 theme_pub <- function(base_size = 14, base_family = "Helvetica") {
   theme_classic(base_size = base_size, base_family = base_family) +
     theme(
@@ -81,7 +79,7 @@ theme_pub <- function(base_size = 14, base_family = "Helvetica") {
       legend.justification = "center",
       legend.box.background = element_rect(color = NA, fill = NA),
       panel.border = element_blank(),
-      panel.grid.major = element_line(color = "gray85", size = 0.30, linetype = "dotted"),
+      panel.grid.major = element_line(color = "gray85", linewidth = 0.30, linetype = "dotted"),
       panel.grid.minor = element_blank(),
       strip.background = element_rect(fill = "gray95", color = NA),
       strip.text = element_text(face = "bold", size = rel(1.05), margin = margin(t = 3, b = 3)),
@@ -91,19 +89,44 @@ theme_pub <- function(base_size = 14, base_family = "Helvetica") {
 
 COLORS <- c("ALS" = "#E64B35", "Ctrl" = "#4DBBD5")
 
-# =============================================================================
 # Helpers ----
-# =============================================================================
-
-bed_colspec <- cols(
-  chrom = col_character(),
-  start0 = col_integer(),
-  end0 = col_integer(),
-  name = col_character(),
-  mapq = col_integer(),
-  strand = col_character(),
-  length_bp = col_integer()
+FRAG_COLS <- c("chrom", "start0", "end0", "name", "mapq", "strand", "length_bp")
+FRAG_COL_CLASSES <- c(
+  chrom = "character",
+  start0 = "integer",
+  end0 = "integer",
+  name = "character",
+  mapq = "integer",
+  strand = "character",
+  length_bp = "integer"
 )
+
+# Chunked reader for gzipped fragment BEDs without readr.
+# Reads TSV with no header: chrom, start0, end0, name, mapq, strand, length_bp
+read_fragments_chunked <- function(path, chunk_size = 200000L, FUN) {
+  chunk_size <- as.integer(chunk_size)
+  con <- gzfile(path, open = "rt")
+  on.exit(try(close(con), silent = TRUE), add = TRUE)
+
+  repeat {
+    x <- utils::read.delim(
+      file = con,
+      header = FALSE,
+      sep = "\t",
+      nrows = chunk_size,
+      col.names = FRAG_COLS,
+      colClasses = FRAG_COL_CLASSES,
+      stringsAsFactors = FALSE,
+      quote = "",
+      comment.char = "",
+      fill = TRUE
+    )
+    if (nrow(x) == 0) break
+    FUN(x)
+  }
+
+  invisible(TRUE)
+}
 
 stop_if_missing_fragments <- function(sample_ids, frag_dir = FRAG_DIR) {
   paths <- file.path(frag_dir, paste0(sample_ids, ".fragments.bed.gz"))
@@ -139,264 +162,17 @@ chunk_to_midpoint_gr <- function(df) {
   )
 }
 
-# =============================================================================
 # Inputs ----
-# =============================================================================
-
 stop_if_missing_fragments(metadata$sample_id, FRAG_DIR)
 fragment_paths <- file.path(FRAG_DIR, paste0(metadata$sample_id, ".fragments.bed.gz"))
 names(fragment_paths) <- metadata$sample_id
 
-# =============================================================================
-# 1) Per-sample fragmentation metrics + size distributions ----
-# =============================================================================
-
-len_min <- 30L
-len_max <- 500L
-len_grid <- len_min:len_max
-len_n <- length(len_grid)
-
-# Standard fragment bins used frequently in fragmentomics
-bins <- tibble::tribble(
-  ~bin,                ~min_bp, ~max_bp,
-  "short_90_150",      90L,     150L,
-  "mono_150_220",      150L,    220L,
-  "long_151_220",      151L,    220L,
-  "di_300_450",        300L,    450L
-)
-
-compute_metrics_from_counts <- function(counts_named) {
-  # counts_named: integer vector named by fragment length (as character)
-  lengths <- as.integer(names(counts_named))
-  counts <- as.numeric(counts_named)
-  n <- sum(counts)
-  if (n == 0) {
-    return(list(
-      total_frags = 0L,
-      median_bp = NA_real_,
-      mean_bp = NA_real_,
-      sd_bp = NA_real_,
-      prop_short_90_150 = NA_real_,
-      prop_mono_150_220 = NA_real_,
-      prop_di_300_450 = NA_real_,
-      short_to_long_ratio = NA_real_
-    ))
-  }
-
-  prop <- counts / n
-  cdf <- cumsum(prop)
-  median_bp <- lengths[which(cdf >= 0.5)[1]]
-  mean_bp <- sum(lengths * prop)
-  sd_bp <- sqrt(sum(((lengths - mean_bp) ^ 2) * prop))
-
-  count_in <- function(min_bp, max_bp) {
-    idx <- which(lengths >= min_bp & lengths <= max_bp)
-    sum(counts[idx])
-  }
-
-  n_short <- count_in(90L, 150L)
-  n_long <- count_in(151L, 220L)
-  n_mono <- count_in(150L, 220L)
-  n_di <- count_in(300L, 450L)
-
-  list(
-    total_frags = as.integer(n),
-    median_bp = as.numeric(median_bp),
-    mean_bp = as.numeric(mean_bp),
-    sd_bp = as.numeric(sd_bp),
-    prop_short_90_150 = n_short / n,
-    prop_mono_150_220 = n_mono / n,
-    prop_di_300_450 = n_di / n,
-    short_to_long_ratio = (n_short + 1) / (n_long + 1)
-  )
-}
-
-message("Summarizing fragment size distributions (streaming BEDs)...")
-
-size_counts_by_sample <- vector("list", length(fragment_paths))
-names(size_counts_by_sample) <- names(fragment_paths)
-
-per_sample_metrics <- purrr::imap_dfr(fragment_paths, function(path, sample_id) {
-  # We stream with readr to avoid loading entire fragment tables into memory.
-  counts <- setNames(rep.int(0L, len_n), as.character(len_grid))
-  n_total <- 0L
-
-  cb <- readr::DataFrameCallback$new(function(x, pos) {
-    # Basic hygiene: keep only sane lengths (we summarize 30–500)
-    l <- x$length_bp
-    keep <- !is.na(l) & (l >= len_min) & (l <= len_max)
-    if (!any(keep)) return(invisible())
-    l <- l[keep]
-    n_total <<- n_total + length(l)
-    tab <- tabulate(l - len_min + 1L, nbins = len_n)
-    counts <<- counts + tab
-    invisible()
-  })
-
-  readr::read_tsv_chunked(
-    file = path,
-    callback = cb,
-    chunk_size = 5e5,
-    col_names = names(bed_colspec$cols),
-    col_types = bed_colspec,
-    progress = interactive()
-  )
-
-  size_counts_by_sample[[sample_id]] <<- counts
-  m <- compute_metrics_from_counts(counts)
-
-  tibble::tibble(
-    sample_id = sample_id,
-    Group = metadata$Group[match(sample_id, metadata$sample_id)],
-    total_frags_30_500 = m$total_frags,
-    median_bp_30_500 = m$median_bp,
-    mean_bp_30_500 = m$mean_bp,
-    sd_bp_30_500 = m$sd_bp,
-    prop_short_90_150 = m$prop_short_90_150,
-    prop_mono_150_220 = m$prop_mono_150_220,
-    prop_di_300_450 = m$prop_di_300_450,
-    short_to_long_ratio_90_150_over_151_220 = m$short_to_long_ratio
-  )
-})
-
-write_csv(per_sample_metrics, file.path(TABLE_DIR, "fragmentation_metrics.csv"))
-
-# Long-form distribution (for plotting group medians)
-dist_long <- purrr::imap_dfr(size_counts_by_sample, function(counts, sample_id) {
-  tibble::tibble(
-    sample_id = sample_id,
-    Group = metadata$Group[match(sample_id, metadata$sample_id)],
-    fragment_length = as.integer(names(counts)),
-    n = as.integer(counts)
-  ) %>%
-    dplyr::group_by(sample_id) %>%
-    dplyr::mutate(prop = .data$n / sum(.data$n)) %>%
-    dplyr::ungroup()
-})
-
-group_median_dist <- dist_long %>%
-  dplyr::group_by(Group, fragment_length) %>%
-  dplyr::summarise(median_prop = stats::median(prop, na.rm = TRUE), .groups = "drop") %>%
-  dplyr::group_by(Group) %>%
-  dplyr::mutate(median_cdf = cumsum(median_prop)) %>%
-  dplyr::ungroup()
-
-# Detrended oscillation panel (10bp periodicity proxy)
-osc_df <- group_median_dist %>%
-  dplyr::filter(fragment_length >= 90, fragment_length <= 220) %>%
-  dplyr::group_by(Group) %>%
-  dplyr::mutate(
-    smooth = moving_average(median_prop, k = 21L),
-    resid = median_prop - smooth
-  ) %>%
-  dplyr::ungroup()
-
-# Figure: overview ----
-p_dist <- ggplot(group_median_dist, aes(x = fragment_length, y = median_prop, color = Group)) +
-  geom_line(linewidth = 0.85) +
-  geom_vline(xintercept = 167, linetype = "dashed", color = "gray25", linewidth = 0.4) +
-  geom_vline(xintercept = 334, linetype = "dashed", color = "gray25", linewidth = 0.4) +
-  scale_color_manual(values = COLORS) +
-  scale_x_continuous(limits = c(len_min, len_max), breaks = seq(50, 500, by = 50)) +
-  labs(
-    title = "Fragment size distribution (group median)",
-    subtitle = "Dashed: mono- (~167 bp) and di-nucleosome (~334 bp) references",
-    x = "Fragment length (bp)",
-    y = "Median proportion",
-    color = "Group"
-  ) +
-  theme_pub(base_size = 12) +
-  theme(legend.position = "top")
-
-p_cdf <- ggplot(group_median_dist, aes(x = fragment_length, y = median_cdf, color = Group)) +
-  geom_line(linewidth = 0.85) +
-  scale_color_manual(values = COLORS) +
-  scale_x_continuous(limits = c(len_min, len_max), breaks = seq(50, 500, by = 50)) +
-  scale_y_continuous(limits = c(0, 1)) +
-  labs(
-    title = "Cumulative fragment distribution (group median)",
-    subtitle = "Median proportion of fragments with length \u2264 N",
-    x = "Fragment length (bp)",
-    y = "Median cumulative proportion",
-    color = "Group"
-  ) +
-  theme_pub(base_size = 12) +
-  theme(legend.position = "top")
-
-p_metrics <- per_sample_metrics %>%
-  tidyr::pivot_longer(
-    cols = c(median_bp_30_500, prop_short_90_150, prop_mono_150_220, prop_di_300_450, short_to_long_ratio_90_150_over_151_220),
-    names_to = "metric",
-    values_to = "value"
-  ) %>%
-  dplyr::mutate(
-    metric = factor(
-      metric,
-      levels = c(
-        "median_bp_30_500",
-        "prop_short_90_150",
-        "prop_mono_150_220",
-        "prop_di_300_450",
-        "short_to_long_ratio_90_150_over_151_220"
-      ),
-      labels = c(
-        "Median length (30–500)",
-        "Short fraction (90–150)",
-        "Mono fraction (150–220)",
-        "Di fraction (300–450)",
-        "Short/Long ratio\n(90–150)/(151–220)"
-      )
-    )
-  ) %>%
-  ggplot(aes(x = Group, y = value, fill = Group)) +
-  geom_violin(trim = TRUE, alpha = 0.35, width = 0.95, linewidth = 0.25, color = NA) +
-  geom_boxplot(width = 0.25, outlier.size = 1.1, linewidth = 0.35, alpha = 0.9) +
-  scale_fill_manual(values = COLORS) +
-  facet_wrap(~metric, scales = "free_y", ncol = 3) +
-  labs(
-    title = "Fragmentation summary metrics (per sample)",
-    x = NULL,
-    y = NULL
-  ) +
-  theme_pub(base_size = 12) +
-  theme(
-    legend.position = "none",
-    strip.text = element_text(size = 10)
-  )
-
-p_osc <- ggplot(osc_df, aes(x = fragment_length, y = resid, color = Group)) +
-  geom_hline(yintercept = 0, linewidth = 0.35, color = "gray70") +
-  geom_line(linewidth = 0.7) +
-  scale_color_manual(values = COLORS) +
-  scale_x_continuous(breaks = seq(90, 220, by = 10)) +
-  labs(
-    title = "Detrended oscillation (90–220 bp)",
-    subtitle = "Residual after 21-bp moving average (visual proxy for 10-bp periodicity)",
-    x = "Fragment length (bp)",
-    y = "Residual proportion",
-    color = "Group"
-  ) +
-  theme_pub(base_size = 12) +
-  theme(legend.position = "top")
-
-fig_overview <- (p_dist | p_cdf) / (p_metrics / p_osc) +
-  plot_annotation(tag_levels = "A")
-
-ggsave(
-  file.path(FIG_DIR, "fig3_fragmentation_overview.png"),
-  fig_overview,
-  width = 16, height = 14, dpi = 300
-)
-
-# =============================================================================
-# 2) Genome-binned fragment size coverage + short/long ratio tracks ----
-# =============================================================================
-
+# 1) Genome-binned fragment size coverage + short/long ratio tracks ----
 message("Computing genome-binned fragmentation ratio tracks (short vs long)...")
 
-bin_size <- 5e6  # 5 Mb bins: stable and fast; reduce for finer tracks if desired
-chroms <- paste0("chr", c(1:22, "X"))
-seqlens <- seqlengths(genome)[chroms]
+bin_size <- 2e6
+chroms <- paste0("chr", c(21))
+seqlens <- GenomeInfoDb::seqlengths(genome)[chroms]
 seqlens <- seqlens[!is.na(seqlens)]
 
 bins_gr <- GenomicRanges::tileGenome(
@@ -406,7 +182,7 @@ bins_gr <- GenomicRanges::tileGenome(
 )
 bins_df <- tibble::tibble(
   bin_id = seq_along(bins_gr),
-  chrom = as.character(seqnames(bins_gr)),
+  chrom = as.character(GenomeInfoDb::seqnames(bins_gr)),
   start = start(bins_gr),
   end = end(bins_gr),
   mid = as.integer(floor((start + end) / 2))
@@ -416,7 +192,7 @@ bin_counts_one_sample <- function(path, bins_gr, short_range = c(90L, 150L), lon
   short_counts <- integer(length(bins_gr))
   long_counts <- integer(length(bins_gr))
 
-  cb <- readr::DataFrameCallback$new(function(x, pos) {
+  cb <- function(x) {
     l <- x$length_bp
     keep <- !is.na(l) & l >= 30L & l <= 500L
     if (!any(keep)) return(invisible())
@@ -446,22 +222,15 @@ bin_counts_one_sample <- function(path, bins_gr, short_range = c(90L, 150L), lon
     }
 
     invisible()
-  })
+  }
 
-  readr::read_tsv_chunked(
-    file = path,
-    callback = cb,
-    chunk_size = 5e5,
-    col_names = names(bed_colspec$cols),
-    col_types = bed_colspec,
-    progress = interactive()
-  )
+  read_fragments_chunked(path = path, chunk_size = 200000L, FUN = cb)
 
   tibble::tibble(
     bin_id = seq_along(bins_gr),
     short = short_counts,
     long = long_counts,
-    log2_short_over_long = log2((short_counts + 1) / (long_counts + 1))
+    short_long_ratio = (short_counts) / (long_counts + 1)
   )
 }
 
@@ -477,7 +246,7 @@ bin_tracks <- purrr::imap_dfr(fragment_paths, function(path, sample_id) {
 bin_tracks_summary <- bin_tracks %>%
   dplyr::group_by(Group, bin_id) %>%
   dplyr::summarise(
-    median_log2_ratio = stats::median(log2_short_over_long, na.rm = TRUE),
+    median_short_long_ratio = stats::median(short_long_ratio, na.rm = TRUE),
     .groups = "drop"
   ) %>%
   dplyr::left_join(bins_df, by = "bin_id") %>%
@@ -488,8 +257,8 @@ bin_tracks_summary <- bin_tracks %>%
     genome_x = {
       # cumulative coordinate per chromosome
       chroms_present <- chroms[chroms %in% names(seqlens)]
-      chr_lens <- as.integer(seqlens[chroms_present])
-      chr_offsets <- cumsum(c(0L, head(chr_lens, -1L)))
+      chr_lens <- as.numeric(seqlens[chroms_present])
+      chr_offsets <- cumsum(c(0, head(chr_lens, -1L)))
       names(chr_offsets) <- chroms_present
       chr_offsets[as.character(chrom)] + mid
     }
@@ -498,15 +267,23 @@ bin_tracks_summary <- bin_tracks %>%
 
 chrom_boundaries <- tibble::tibble(
   chrom = chroms[chroms %in% names(seqlens)],
-  chr_len = as.integer(seqlens[chroms[chroms %in% names(seqlens)]])
+  chr_len = as.numeric(seqlens[chroms[chroms %in% names(seqlens)]])
 ) %>%
   dplyr::mutate(
-    offset = cumsum(dplyr::lag(chr_len, default = 0L)),
+    offset = cumsum(dplyr::lag(chr_len, default = 0)),
     boundary = offset + chr_len,
     center = offset + chr_len / 2
   )
 
-p_tracks <- ggplot(bin_tracks_summary, aes(x = genome_x, y = median_log2_ratio, color = Group)) +
+bin_label <- if (is.finite(bin_size) && bin_size >= 1e6) {
+  sprintf("%.0f Mb", bin_size / 1e6)
+} else if (is.finite(bin_size) && bin_size >= 1e3) {
+  sprintf("%.0f kb", bin_size / 1e3)
+} else {
+  sprintf("%s bp", format(bin_size, scientific = FALSE, big.mark = ","))
+}
+
+p_tracks <- ggplot(bin_tracks_summary, aes(x = genome_x, y = median_short_long_ratio, color = Group)) +
   geom_hline(yintercept = 0, color = "gray70", linewidth = 0.35) +
   geom_line(linewidth = 0.65, alpha = 0.95) +
   geom_vline(
@@ -524,9 +301,9 @@ p_tracks <- ggplot(bin_tracks_summary, aes(x = genome_x, y = median_log2_ratio, 
   ) +
   labs(
     title = "Genome-wide fragmentation ratio track (group median)",
-    subtitle = "Median log2((short 90–150 + 1)/(long 151–220 + 1)) in 5 Mb bins",
+    subtitle = sprintf("Median (short 90–150) / (long 151–220 + 1) in %s bins", bin_label),
     x = "Chromosome",
-    y = "Median log2(short/long)",
+    y = "Median short/long ratio",
     color = "Group"
   ) +
   theme_pub(base_size = 12) +
@@ -541,6 +318,90 @@ ggsave(
   width = 16, height = 6, dpi = 300
 )
 
+# Optional: Chromosome-style visualization with Gviz ----
+if (!requireNamespace("Gviz", quietly = TRUE)) {
+  BiocManager::install("Gviz")
+}
+suppressPackageStartupMessages(library(Gviz))
+
+  genome_build <- "hg38"
+  chrom <- as.character(chroms[[1]])
+  from_bp <- min(bins_df$start, na.rm = TRUE)
+  to_bp <- max(bins_df$end, na.rm = TRUE)
+
+  # One value per bin (same order as bins_df)
+  gr_bins <- GenomicRanges::GRanges(
+    seqnames = bins_df$chrom,
+    ranges = IRanges::IRanges(start = bins_df$start, end = bins_df$end)
+  )
+
+  # ALS/Ctrl ratio of the group-median short/long ratios (per bin)
+  eps <- 1e-6
+  ratio_wide <- bin_tracks_summary %>%
+    dplyr::select(bin_id, Group, median_short_long_ratio) %>%
+    tidyr::pivot_wider(names_from = Group, values_from = median_short_long_ratio) %>%
+    dplyr::arrange(bin_id) %>%
+    dplyr::mutate(
+      als_over_ctrl = (`ALS` + eps) / (`Ctrl` + eps),
+      log2_als_over_ctrl = log2(als_over_ctrl)
+    )
+
+  # Prefer log2 scale for interpretability (baseline = 0), but label as ALS/Ctrl
+  y <- ratio_wide$log2_als_over_ctrl
+  y_lim <- stats::quantile(y, probs = c(0.01, 0.99), na.rm = TRUE, names = FALSE)
+  y_pad <- 0.15 * diff(y_lim)
+  y_lim <- c(y_lim[1] - y_pad, y_lim[2] + y_pad)
+
+  axis_track <- Gviz::GenomeAxisTrack(genome = genome_build, chromosome = chrom, name = "")
+
+  ratio_track <- Gviz::DataTrack(
+    range = gr_bins,
+    data = y,
+    genome = genome_build,
+    chromosome = chrom,
+    name = "ALS/Ctrl\nshort/long",
+    type = "l",
+    col = "#2E2E2E",
+    lwd = 2,
+    ylim = y_lim,
+    baseline = 0,
+    col.baseline = "gray45",
+    lty.baseline = 2,
+    lwd.baseline = 1,
+    cex.axis = 0.9,
+    cex.title = 0.70
+  )
+
+  ideo_track <- tryCatch(
+    {
+      Gviz::IdeogramTrack(genome = genome_build, chromosome = chrom)
+    },
+    error = function(e) NULL
+  )
+
+  tracks <- list(axis_track, ratio_track)
+  if (!is.null(ideo_track)) tracks <- c(list(ideo_track), tracks)
+
+  png(
+    file.path(FIG_DIR, "fig4_fragmentation_ratio_tracks_gviz.png"),
+    width = 2400,
+    height = if (!is.null(ideo_track)) 900 else 700,
+    res = 300
+  )
+  Gviz::plotTracks(
+    tracks,
+    from = from_bp,
+    to = to_bp,
+    main = "Fragmentation ratio track (ALS/Ctrl)",
+    background.title = "white",
+    col.title = "black",
+    cex.title = 0.20,
+    background.panel = "white",
+    col.axis = "black",
+    col.frame = "gray85"
+  )
+  dev.off()
+
 # =============================================================================
 # 3) Nucleosome positioning proxy: TSS-centered midpoint density ----
 # =============================================================================
@@ -548,13 +409,14 @@ ggsave(
 message("Computing TSS-centered nucleosome positioning profiles...")
 
 ensure_txdb <- function() {
-  if (!requireNamespace("GenomicFeatures", quietly = TRUE)) {
-    if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
-    BiocManager::install("GenomicFeatures", ask = FALSE, update = FALSE)
-  }
-  if (!requireNamespace("TxDb.Hsapiens.UCSC.hg38.knownGene", quietly = TRUE)) {
-    if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
-    BiocManager::install("TxDb.Hsapiens.UCSC.hg38.knownGene", ask = FALSE, update = FALSE)
+  if (!requireNamespace("GenomicFeatures", quietly = TRUE) ||
+      !requireNamespace("TxDb.Hsapiens.UCSC.hg38.knownGene", quietly = TRUE)) {
+    stop(
+      "Missing Bioconductor annotation packages required for TSS profiles.\n",
+      "Please install (once) and re-run:\n",
+      "  BiocManager::install(c('GenomicFeatures','TxDb.Hsapiens.UCSC.hg38.knownGene'))\n",
+      call. = FALSE
+    )
   }
   suppressPackageStartupMessages(library(GenomicFeatures))
   suppressPackageStartupMessages(library(TxDb.Hsapiens.UCSC.hg38.knownGene))
@@ -565,13 +427,15 @@ txdb <- ensure_txdb()
 
 # TSS points (strand-aware) and windows
 tss_window <- 2000L
-tss_points <- GenomicFeatures::promoters(txdb, upstream = 0L, downstream = 1L) # 1-bp at TSS
-tss_windows <- GenomicFeatures::promoters(txdb, upstream = tss_window, downstream = tss_window)
+tss_points <- suppressWarnings(GenomicFeatures::promoters(txdb, upstream = 0L, downstream = 1L)) # 1-bp at TSS
+tss_windows <- suppressWarnings(GenomicFeatures::promoters(txdb, upstream = tss_window, downstream = tss_window))
 
-# Keep standard chroms only, drop NAs, de-duplicate exact coordinates
-tss_keep <- as.character(seqnames(tss_windows)) %in% chroms
-tss_points <- tss_points[tss_keep]
-tss_windows <- tss_windows[tss_keep]
+# Keep standard chroms only, trim out-of-bound windows, de-duplicate exact coordinates
+tss_points <- GenomeInfoDb::keepStandardChromosomes(tss_points, pruning.mode = "coarse")
+tss_windows <- GenomeInfoDb::keepStandardChromosomes(tss_windows, pruning.mode = "coarse")
+tss_points <- GenomeInfoDb::keepSeqlevels(tss_points, value = intersect(seqlevels(tss_points), chroms), pruning.mode = "coarse")
+tss_windows <- GenomeInfoDb::keepSeqlevels(tss_windows, value = intersect(seqlevels(tss_windows), chroms), pruning.mode = "coarse")
+tss_windows <- GenomicRanges::trim(tss_windows)
 tss_points <- unique(tss_points)
 tss_windows <- unique(tss_windows)
 
@@ -600,7 +464,7 @@ profile_one_sample <- function(path, tss_windows, tss_site, tss_strand, len_rang
   n_short <- 0L
   n_long <- 0L
 
-  cb <- readr::DataFrameCallback$new(function(x, pos) {
+  cb <- function(x) {
     l <- x$length_bp
     keep <- !is.na(l) & l >= len_range[1] & l <= len_range[2]
     if (!any(keep)) return(invisible())
@@ -654,16 +518,9 @@ profile_one_sample <- function(path, tss_windows, tss_site, tss_strand, len_rang
     }
 
     invisible()
-  })
+  }
 
-  readr::read_tsv_chunked(
-    file = path,
-    callback = cb,
-    chunk_size = 5e5,
-    col_names = names(bed_colspec$cols),
-    col_types = bed_colspec,
-    progress = interactive()
-  )
+  read_fragments_chunked(path = path, chunk_size = 200000L, FUN = cb)
 
   list(
     rel = rel_grid,

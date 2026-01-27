@@ -139,37 +139,8 @@ if (file.exists(lockfile)) {
     }
   }
 
-  # cfDNAPro: try GitHub first, then fall back to Bioconductor if needed.
-  if (!requireNamespace("cfDNAPro", quietly = TRUE)) {
-    ok <- FALSE
-    tryCatch(
-      {
-        remotes::install_github("hw538/cfDNAPro", dependencies = TRUE, upgrade = "never")
-        ok <- TRUE
-      },
-      error = function(e) {
-        message("cfDNAPro GitHub install failed: ", e$message)
-      }
-    )
-    if (!ok) {
-      tryCatch(
-        {
-          BiocManager::install("cfDNAPro", ask = FALSE, update = TRUE)
-          ok <- TRUE
-        },
-        error = function(e) {
-          message("cfDNAPro Bioconductor install also failed: ", e$message)
-        }
-      )
-    }
-  }
-
-  if (requireNamespace("cfDNAPro", quietly = TRUE)) {
-    snapshot_packages <- c(snapshot_packages, "cfDNAPro")
-  }
-
   # Snapshot captures exact versions into renv.lock.
-  # Use an explicit package list so failed optional installs (e.g., cfDNAPro) don't block snapshot.
+  # Use an explicit package list for deterministic snapshots.
   options(repos = BiocManager::repositories(version = BIOC_VERSION))
   renv::settings$bioconductor.version(BIOC_VERSION)
   renv::snapshot(packages = snapshot_packages, prompt = FALSE, force = TRUE)
@@ -194,9 +165,5 @@ suppressPackageStartupMessages(library(BSgenome.Hsapiens.UCSC.hg38))
 suppressPackageStartupMessages(library(patchwork))
 suppressPackageStartupMessages(library(here))
 suppressPackageStartupMessages(library(parallel))
-
-if (requireNamespace("cfDNAPro", quietly = TRUE)) {
-  suppressPackageStartupMessages(library(cfDNAPro))
-}
 
 message("Setup complete. renv restored and packages loaded (project root: ", project_root, ").")
