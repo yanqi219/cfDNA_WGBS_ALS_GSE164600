@@ -1,0 +1,32 @@
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# renv
+renv/library/
+renv/staging/
+renv/sandbox/
+renv/local/
+
+# Large data files
+data/raw/*.bam
+data/raw/*.bam.bai
+data/raw/*.bai
+*.bam
+*.bam.bai
+*.bai
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+
+# Temporary files
+*.tmp
+*~
+.DS_Store
+
+# Large outputs (optional - uncomment if needed)
+# data/processed/*.rds
+# results/figures/*.pdf

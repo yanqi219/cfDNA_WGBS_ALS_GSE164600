@@ -1,0 +1,5 @@
+sample_id,group,bam_file
+# Add your sample information here
+# Example:
+# SRR123456,ALS,SRR123456.bam
+# SRR123457,CTRL,SRR123457.bam
