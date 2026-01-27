@@ -1,5 +1,23 @@
-sample_id,group,bam_file
-# Add your sample information here
-# Example:
-# SRR123456,ALS,SRR123456.bam
-# SRR123457,CTRL,SRR123457.bam
+sample_id,Bam_file,Group,Age,Tissue,Organism,Experiment,GEO_Accession
+SRR13404367,SRR13404367.deduplicated.sorted_ds10mill_chr21.bam,ALS,61,Blood,Homo sapiens,SRX9823219,GSM5014683
+SRR13404368,SRR13404368.deduplicated.sorted_ds10mill_chr21.bam,ALS,57,Blood,Homo sapiens,SRX9823220,GSM5014684
+SRR13404369,SRR13404369.deduplicated.sorted_ds10mill_chr21.bam,ALS,85,Blood,Homo sapiens,SRX9823221,GSM5014685
+SRR13404370,SRR13404370.deduplicated.sorted_ds10mill_chr21.bam,ALS,63,Blood,Homo sapiens,SRX9823222,GSM5014686
+SRR13404371,SRR13404371.deduplicated.sorted_ds10mill_chr21.bam,Ctrl,60,Blood,Homo sapiens,SRX9823223,GSM5014687
+SRR13404372,SRR13404372.deduplicated.sorted_ds10mill_chr21.bam,Ctrl,59,Blood,Homo sapiens,SRX9823224,GSM5014688
+SRR13404373,SRR13404373.deduplicated.sorted_ds10mill_chr21.bam,Ctrl,83,Blood,Homo sapiens,SRX9823225,GSM5014689
+SRR13404374,SRR13404374.deduplicated.sorted_ds10mill_chr21.bam,Ctrl,62,Blood,Homo sapiens,SRX9823226,GSM5014690
+SRR13404375,SRR13404375.deduplicated.sorted_ds10mill_chr21.bam,ALS,69,Blood,Homo sapiens,SRX9823227,GSM5014691
+SRR13404376,SRR13404376.deduplicated.sorted_ds10mill_chr21.bam,ALS,56,Blood,Homo sapiens,SRX9823228,GSM5014692
+SRR13404377,SRR13404377.deduplicated.sorted_ds10mill_chr21.bam,ALS,73,Blood,Homo sapiens,SRX9823229,GSM5014693
+SRR13404378,SRR13404378.deduplicated.sorted_ds10mill_chr21.bam,ALS,69,Blood,Homo sapiens,SRX9823230,GSM5014694
+SRR13404379,SRR13404379.deduplicated.sorted_ds10mill_chr21.bam,ALS,61,Blood,Homo sapiens,SRX9823231,GSM5014695
+SRR13404380,SRR13404380.deduplicated.sorted_ds10mill_chr21.bam,ALS,54,Blood,Homo sapiens,SRX9823232,GSM5014696
+SRR13404381,SRR13404381.deduplicated.sorted_ds10mill_chr21.bam,ALS,65,Blood,Homo sapiens,SRX9823233,GSM5014697
+SRR13404382,SRR13404382.deduplicated.sorted_ds10mill_chr21.bam,ALS,53,Blood,Homo sapiens,SRX9823234,GSM5014698
+SRR13404383,SRR13404383.deduplicated.sorted_ds10mill_chr21.bam,Ctrl,55,Blood,Homo sapiens,SRX9823235,GSM5014699
+SRR13404384,SRR13404384.deduplicated.sorted_ds10mill_chr21.bam,Ctrl,54,Blood,Homo sapiens,SRX9823236,GSM5014700
+SRR13404385,SRR13404385.deduplicated.sorted_ds10mill_chr21.bam,Ctrl,65,Blood,Homo sapiens,SRX9823237,GSM5014701
+SRR13404386,SRR13404386.deduplicated.sorted_ds10mill_chr21.bam,Ctrl,74,Blood,Homo sapiens,SRX9823238,GSM5014702
+SRR13404387,SRR13404387.deduplicated.sorted_ds10mill_chr21.bam,Ctrl,63,Blood,Homo sapiens,SRX9823239,GSM5014703
+SRR13404388,SRR13404388.deduplicated.sorted_ds10mill_chr21.bam,Ctrl,66,Blood,Homo sapiens,SRX9823240,GSM5014704

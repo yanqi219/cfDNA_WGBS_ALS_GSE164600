@@ -39,16 +39,35 @@ cfDNA_WGBS_ALS_GSE164600/
 Scripts are numbered in execution order:
 
 - `00_setup.R` - Install packages
-- `01_extract_features.R` - Extract fragment features from BAM files
+- `01_qc_processing.R` - Comprehensive QC and initial statistics
 - `02_analysis.R` - Statistical analysis and visualization
 - `03_classification.R` - ALS vs Control classification
 
 ## Key Analyses
 
-1. **Fragment Length Distribution** - Insert size analysis
-2. **End Motif Analysis** - 4-mer motif frequencies at fragment ends
-3. **Methylation Analysis** - CpG methylation from Bismark XM tag
-4. **Classification** - Binary classification with performance metrics
+### 1. QC & Processing (`01_qc_processing.R`)
+
+Generates publication-quality figures covering:
+
+| Analysis | Description | cfDNA Relevance |
+|----------|-------------|-----------------|
+| **Fragment Length** | Insert size distribution, 167bp peak, 10.4bp periodicity | Nucleosome footprint |
+| **End Motifs** | 4-mer frequencies at 5' fragment ends | Tissue-specific cleavage patterns |
+| **Methylation QC** | CpG methylation levels | Disease marker |
+| **Bisulfite Conversion** | CHH methylation (should be <1%) | Data quality |
+| **Sample Metrics** | Read counts, MAPQ, fragment ratios | Technical quality |
+
+**Output figures:**
+- `fig1_fragment_length.pdf` - Fragment size distribution
+- `fig2_end_motifs.pdf` - End motif analysis
+- `fig3_methylation_qc.pdf` - Methylation quality control
+- `fig4_sample_qc_overview.pdf` - Sample quality summary
+- `fig5_statistical_comparison.pdf` - ALS vs Control comparison
+
+### 2. Downstream Analysis
+
+- **Statistical Analysis** - Differential features between groups
+- **Classification** - Binary classification with precision, sensitivity, F1
 
 ## Notes
 
