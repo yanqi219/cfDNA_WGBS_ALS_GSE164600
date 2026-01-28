@@ -16,24 +16,31 @@
 # }
 # source(setup_path)
 
-suppressPackageStartupMessages(library(ggplot2))
-suppressPackageStartupMessages(library(dplyr))
-suppressPackageStartupMessages(library(tidyr))
-suppressPackageStartupMessages(library(readr))
-suppressPackageStartupMessages(library(purrr))
-suppressPackageStartupMessages(library(stringr))
-suppressPackageStartupMessages(library(tibble))
-suppressPackageStartupMessages(library(caret))
-suppressPackageStartupMessages(library(pROC))
-suppressPackageStartupMessages(library(Rsamtools))
-suppressPackageStartupMessages(library(GenomicAlignments))
-suppressPackageStartupMessages(library(GenomicRanges))
-suppressPackageStartupMessages(library(IRanges))
-suppressPackageStartupMessages(library(Biostrings))
-suppressPackageStartupMessages(library(BSgenome.Hsapiens.UCSC.hg38))
-suppressPackageStartupMessages(library(patchwork))
-suppressPackageStartupMessages(library(here))
-suppressPackageStartupMessages(library(parallel))
+# Function to install and load packages if missing
+install_and_load <- function(pkg, bioc=FALSE) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (bioc) {
+      if (!requireNamespace("BiocManager", quietly = TRUE)) {
+        install.packages("BiocManager")
+      }
+      BiocManager::install(pkg, ask = FALSE, update = FALSE)
+    } else {
+      install.packages(pkg)
+    }
+  }
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}
+
+cran_pkgs <- c(
+  "ggplot2", "dplyr", "tidyr", "readr", "purrr", "stringr", "tibble",
+  "caret", "pROC", "patchwork", "here", "parallel"
+)
+bioc_pkgs <- c(
+  "Rsamtools", "GenomicAlignments", "GenomicRanges", "IRanges",
+  "Biostrings", "BSgenome.Hsapiens.UCSC.hg38"
+)
+invisible(lapply(cran_pkgs, install_and_load, bioc = FALSE))
+invisible(lapply(bioc_pkgs, install_and_load, bioc = TRUE))
 
 # Paths
 PROJECT_DIR <- here::here()
@@ -43,6 +50,7 @@ RESULTS_DIR <- file.path(PROJECT_DIR, "cfDNA_WGBS_ALS_GSE164600/results")
 FIG_DIR <- file.path(RESULTS_DIR, "figures")
 TABLE_DIR <- file.path(RESULTS_DIR, "tables")
 FRAG_DIR <- file.path(DATA_DIR, "processed", "fragments")
+BEDPE_DIR <- file.path(DATA_DIR, "processed", "bedpe")
 # Create output dir
 if (!dir.exists(RESULTS_DIR)) {
   dir.create(RESULTS_DIR, recursive = TRUE, showWarnings = FALSE)
@@ -55,6 +63,9 @@ if (!dir.exists(TABLE_DIR)) {
 }
 if (!dir.exists(FRAG_DIR)) {
   dir.create(FRAG_DIR, recursive = TRUE, showWarnings = FALSE)
+}
+if (!dir.exists(BEDPE_DIR)) {
+  dir.create(BEDPE_DIR, recursive = TRUE, showWarnings = FALSE)
 }
 
 # Load sample metadata
@@ -176,6 +187,12 @@ get_flagstat <- function(bam_path) {
 # sample_id Sample identifier
 # genome BSgenome object for sequence extraction
 # chunk_size Number of reads per chunk (memory management)
+{
+  bam_path <- file.path(RAW_DIR, metadata$Bam_file[1])
+  sample_id = metadata$sample_id[1]
+  frag_dir = FRAG_DIR
+  chunk_size = 1e6
+}
 extract_bam_metrics <- function(bam_path, sample_id, genome, chunk_size = 1e6, frag_dir = FRAG_DIR) {
 
   message(sprintf("Processing: %s", sample_id))
@@ -193,8 +210,10 @@ extract_bam_metrics <- function(bam_path, sample_id, genome, chunk_size = 1e6, f
   param <- ScanBamParam(
     flag = scanBamFlag(isPaired = TRUE, isProperPair = TRUE,
                        isUnmappedQuery = FALSE, hasUnmappedMate = FALSE,
-                       isDuplicate = FALSE),
-    what = c("qname", "flag", "rname", "pos", "mapq", "isize", "seq", "qwidth"),
+                       isDuplicate = FALSE,
+                       isSecondaryAlignment = FALSE, isSupplementaryAlignment = FALSE,
+                       isNotPassingQualityControls = FALSE),
+    what = c("qname", "flag", "rname", "pos", "mapq", "cigar", "isize", "seq", "qwidth"),
     tag = c("XM")  # Bismark methylation tag
   )
 
@@ -203,16 +222,35 @@ extract_bam_metrics <- function(bam_path, sample_id, genome, chunk_size = 1e6, f
   open(bf)
 
   frag_lengths <- integer()
-  motif_5p <- character()
   meth_calls <- list()
   total_reads <- 0
   mapq_values <- integer()
-  
-  # Stream fragments to BED (gzipped) for downstream fragmentation analyses
-  # BED columns: chrom, start(0-based), end(0-based, exclusive), name, mapq, strand, length
+
+  # Output files (protocol-faithful): write BEDPE first, then derive fragment BED from BEDPE.
+  # BEDPE format matches `bedtools bamtobed -bedpe` coordinate conventions:
+  # - start = 0-based, end = 0-based exclusive
+  # - columns: chrom1 start1 end1 chrom2 start2 end2 name score strand1 strand2
+  bedpe_path <- file.path(BEDPE_DIR, paste0(sample_id, ".bedpe.gz"))
+  bedpe_con <- gzfile(bedpe_path, open = "wt")
+  on.exit(try(close(bedpe_con), silent = TRUE), add = TRUE)
+
+  # Fragment BED consumed by downstream scripts in this repo:
+  # chrom, start0, end0, name, mapq, strand, length_bp
+  # where start0 is 0-based, end0 is compatible with 1-based inclusive coordinate for BSgenome
+  # conversion via: start1 = start0 + 1; end1 = end0; and length_bp == end0 - start0.
   fragment_bed_path <- file.path(frag_dir, paste0(sample_id, ".fragments.bed.gz"))
-  bed_con <- gzfile(fragment_bed_path, open = "wt")
-  on.exit(try(close(bed_con), silent = TRUE), add = TRUE)
+  frag_con <- gzfile(fragment_bed_path, open = "wt")
+  on.exit(try(close(frag_con), silent = TRUE), add = TRUE)
+
+  # Carry-over buffer for mate pairing across chunk boundaries
+  pending_aln <- tibble::tibble(
+    qname = character(),
+    flag = integer(),
+    rname = character(),
+    pos = integer(),
+    cigar = character(),
+    mapq = integer()
+  )
 
   # Process in chunks
   repeat {
@@ -238,91 +276,116 @@ extract_bam_metrics <- function(bam_path, sample_id, genome, chunk_size = 1e6, f
     # Total reads after filtering
     total_reads <- total_reads + length(chunk$qname)
 
-    # Fragment lengths, Flag 64 = first in pair
-    is_first <- bitwAnd(chunk$flag, 64) > 0
-    isize <- abs(chunk$isize[is_first])
-    # isize <- isize[isize > 0 & isize < 1000]
-    frag_lengths <- c(frag_lengths, isize)
-
-    # Generate fragment BED entries
-    idx_frag <- which(
-      is_first &
-        !is.na(chunk$isize) & chunk$isize != 0 &
-        !is.na(chunk$pos) &
-        !is.na(chunk$rname)
-    )
-    if (length(idx_frag) > 0) {
-      tlen <- chunk$isize[idx_frag]
-      pos <- chunk$pos[idx_frag]
-      qwidth <- chunk$qwidth[idx_frag]
-
-      frag_start <- ifelse(tlen > 0, pos, pos + qwidth + tlen)
-      frag_len <- abs(tlen)
-      frag_end <- frag_start + frag_len - 1
-
-      keep_frag <- is.finite(frag_start) & is.finite(frag_end) & frag_len > 0 & frag_start > 0 & frag_end >= frag_start
-      if (any(keep_frag)) {
-        chrom <- as.character(chunk$rname[idx_frag][keep_frag])
-        bed_start0 <- as.integer(frag_start[keep_frag] - 1)
-        bed_end0 <- as.integer(frag_end[keep_frag])
-        name <- as.character(chunk$qname[idx_frag][keep_frag])
-        mapq <- as.integer(chunk$mapq[idx_frag][keep_frag])
-        strand <- ifelse(tlen[keep_frag] > 0, "+", "-")
-        length_bp <- as.integer(frag_len[keep_frag])
-
-        bed_lines <- paste(chrom, bed_start0, bed_end0, name, mapq, strand, length_bp, sep = "\t")
-        writeLines(bed_lines, con = bed_con, useBytes = TRUE)
-      }
-    }
-
-    # End motifs
-    if (length(chunk$rname) > 0) {
-      idx <- idx_frag
-
-      if (length(idx) > 0) {
-        tlen <- chunk$isize[idx]
-        pos <- chunk$pos[idx]
-        qwidth <- chunk$qwidth[idx]
-
-        frag_start <- ifelse(tlen > 0, pos, pos + qwidth + tlen)
-        frag_width <- abs(tlen)
-        frag_end <- frag_start + frag_width - 1
-
-        gr_left <- GRanges(
-          seqnames = chunk$rname[idx],
-          ranges = IRanges(start = frag_start, width = 4),
-          strand = "+"
+    # BEDPE -> fragment BED (bedtools-style pairing; robust to chunk boundaries) ----
+    # We pair alignments by QNAME using both mates' alignment records.
+    # Fragment coordinates come from the union span of the two mate alignments.
+    if (length(chunk$qname) > 0) {
+      aln <- tibble::tibble(
+        qname = as.character(chunk$qname),
+        flag = as.integer(chunk$flag),
+        rname = as.character(chunk$rname),
+        pos = as.integer(chunk$pos),
+        cigar = as.character(chunk$cigar),
+        mapq = as.integer(chunk$mapq)
+      ) %>%
+        dplyr::filter(
+          !is.na(qname),
+          !is.na(rname),
+          !is.na(pos),
+          !is.na(cigar),
+          is.finite(pos),
+          pos > 0L
         )
 
-        gr_right <- GRanges(
-          seqnames = chunk$rname[idx],
-          ranges = IRanges(start = frag_end - 3, width = 4),
-          strand = "-"
-        )
+      if (nrow(aln) > 0) {
+        aln <- aln %>%
+          dplyr::mutate(
+            start0 = pos - 1L,
+            end0_excl = start0 + as.integer(GenomicAlignments::cigarWidthAlongReferenceSpace(cigar)),
+            strand = dplyr::if_else(bitwAnd(flag, 16L) > 0L, "-", "+")
+          ) %>%
+          dplyr::filter(is.finite(start0), is.finite(end0_excl), end0_excl > start0)
 
-        # Validate coordinates
-        valid_left <- start(gr_left) > 0
-        valid_right <- start(gr_right) > 0
+        aln_all <- dplyr::bind_rows(pending_aln, aln)
+        tab <- table(aln_all$qname)
+        have_pair <- names(tab[tab >= 2L])
 
-        # get sequences
-        if (any(valid_left)) {
-          seqs_left <- tryCatch(
-            getSeq(genome, gr_left[valid_left]),
-            error = function(e) DNAStringSet()
-          )
-          if (length(seqs_left) > 0) {
-            motif_5p <- c(motif_5p, as.character(seqs_left))
+        if (length(have_pair) > 0) {
+          pair_rows <- aln_all %>%
+            dplyr::filter(qname %in% have_pair) %>%
+            dplyr::group_by(qname) %>%
+            dplyr::slice(1:2) %>%
+            dplyr::ungroup()
+
+          pending_aln <- aln_all %>%
+            dplyr::filter(!(qname %in% have_pair))
+
+          # Order mates to mimic bedtools BEDPE ordering:
+          # - if same chrom: smaller start0 first
+          # - else: lexicographically lower chrom first
+          pair_rows <- pair_rows %>%
+            dplyr::group_by(qname) %>%
+            dplyr::mutate(
+              mate_raw = dplyr::row_number(),
+              swap = dplyr::if_else(
+                rname[1] == rname[2],
+                start0[1] > start0[2],
+                rname[1] > rname[2]
+              ),
+              mate = dplyr::if_else(swap, 3L - mate_raw, mate_raw)
+            ) %>%
+            dplyr::ungroup()
+
+          pair_w <- pair_rows %>%
+            dplyr::select(qname, mate, rname, start0, end0_excl, mapq, strand) %>%
+            tidyr::pivot_wider(
+              names_from = mate,
+              values_from = c(rname, start0, end0_excl, mapq, strand),
+              names_sep = "_"
+            ) %>%
+            dplyr::filter(!is.na(rname_1) & !is.na(rname_2))
+
+          if (nrow(pair_w) > 0) {
+            score <- pmin(pair_w$mapq_1, pair_w$mapq_2)
+
+            bedpe_lines <- paste(
+              pair_w$rname_1, pair_w$start0_1, pair_w$end0_excl_1,
+              pair_w$rname_2, pair_w$start0_2, pair_w$end0_excl_2,
+              pair_w$qname, score, pair_w$strand_1, pair_w$strand_2,
+              sep = "\t"
+            )
+            writeLines(bedpe_lines, con = bedpe_con, useBytes = TRUE)
+
+            # Derive fragment BED intervals from BEDPE (same-chrom pairs only)
+            same_chr <- pair_w$rname_1 == pair_w$rname_2
+            if (any(same_chr)) {
+              # Protocol-faithful "BEDPE -> fragment" definition:
+              # fragment start = chrom1/start1 (BEDPE col 2), fragment end = chrom2/end2 (BEDPE col 6)
+              # (this matches the common awk pattern: frag_size = $6 - $2)
+              frag_start0 <- pair_w$start0_1[same_chr]
+              frag_end0 <- pair_w$end0_excl_2[same_chr]
+              length_bp <- frag_end0 - frag_start0
+
+              # Keep "reasonable" fragment sizes for downstream plots/metrics
+              keep_len <- is.finite(length_bp) & length_bp > 0L & length_bp <= 1000L
+              if (any(keep_len)) {
+                frag_lines <- paste(
+                  pair_w$rname_1[same_chr][keep_len],
+                  as.integer(frag_start0[keep_len]),
+                  as.integer(frag_end0[keep_len]),
+                  pair_w$qname[same_chr][keep_len],
+                  as.integer(score[same_chr][keep_len]),
+                  pair_w$strand_1[same_chr][keep_len],
+                  as.integer(length_bp[keep_len]),
+                  sep = "\t"
+                )
+                writeLines(frag_lines, con = frag_con, useBytes = TRUE)
+                frag_lengths <- c(frag_lengths, as.integer(length_bp[keep_len]))
+              }
+            }
           }
-        }
-
-        if (any(valid_right)) {
-          seqs_right <- tryCatch(
-            getSeq(genome, gr_right[valid_right]),
-            error = function(e) DNAStringSet()
-          )
-          if (length(seqs_right) > 0) {
-            motif_5p <- c(motif_5p, as.character(seqs_right))
-          }
+        } else {
+          pending_aln <- aln_all
         }
       }
     }
@@ -353,10 +416,10 @@ extract_bam_metrics <- function(bam_path, sample_id, genome, chunk_size = 1e6, f
   list(
     sample_id = sample_id,
     fragment_bed = fragment_bed_path,
+    bedpe = bedpe_path,
     flagstat = flagstat,
     filtered_reads = total_reads,  # Reads passing quality filters
     fragment_lengths = frag_lengths,
-    motifs_5p = motif_5p,
     mapq = mapq_values,
     methylation = meth_summary
   )
@@ -423,7 +486,6 @@ calculate_summary_stats <- function(metrics) {
     mono_nuc_ratio = sum(fl >= 150 & fl <= 220) / length(fl),  # mono-nucleosome
     di_nuc_ratio = sum(fl >= 300 & fl <= 400) / length(fl),  # di-nucleosome
     mean_mapq = mean(metrics$mapq),
-    n_motifs = length(metrics$motifs_5p),
     cpg_methylation = cpg_meth_rate,
     chh_methylation = chh_meth_rate,
     bisulfite_conversion = bisulfite_conv
@@ -757,129 +819,7 @@ ggsave(file.path(FIG_DIR, "fig2_insert_size.png"),
        is_combined, width = 14, height = 18, dpi = 300)
 
 
-# Figure 3: End Motif Analysis ----
-## Aggregate motif counts ----
-motif_df <- map_dfr(all_metrics, function(m) {
-  if (length(m$motifs_5p) == 0) return(NULL)
-  
-  # Count motifs
-  motif_counts <- table(m$motifs_5p)
-  
-  data.frame(
-    sample_id = m$sample_id,
-    motif = names(motif_counts),
-    count = as.integer(motif_counts)
-  )
-})
-motif_df <- motif_df %>%
-  dplyr::left_join(metadata, by = "sample_id")
 
-# Calculate frequencies per sample
-motif_freq <- motif_df %>%
-  group_by(sample_id, Group) %>%
-  mutate(frequency = count / sum(count)) %>%
-  ungroup()
-
-# Average frequency by group
-motif_summary <- motif_freq %>%
-  group_by(group, motif) %>%
-  summarise(
-    mean_freq = mean(frequency),
-    sd_freq = sd(frequency),
-    .groups = "drop"
-  )
-
-# Top 20 motifs
-top_motifs <- motif_summary %>%
-  group_by(motif) %>%
-  summarise(total_freq = sum(mean_freq)) %>%
-  arrange(desc(total_freq)) %>%
-  head(20) %>%
-  pull(motif)
-
-# 2A: Bar plot of top motifs
-p2a <- motif_summary %>%
-  filter(motif %in% top_motifs) %>%
-  ggplot(aes(x = reorder(motif, mean_freq), y = mean_freq, fill = group)) +
-  geom_col(position = "dodge", width = 0.7) +
-  scale_fill_manual(values = COLORS) +
-  coord_flip() +
-  labs(
-    title = "Top 20 Fragment End Motifs (5')",
-    x = "4-mer Motif",
-    y = "Mean Frequency",
-    fill = "Group"
-  ) +
-  theme_pub()
-
-# 2B: Motif frequency comparison (ALS vs Ctrl)
-motif_wide <- motif_summary %>%
-  select(group, motif, mean_freq) %>%
-  pivot_wider(names_from = group, values_from = mean_freq, values_fill = 0)
-
-if ("ALS" %in% names(motif_wide) && "Ctrl" %in% names(motif_wide)) {
-  motif_wide <- motif_wide %>%
-    mutate(
-      log2fc = log2((ALS + 1e-6) / (Ctrl + 1e-6)),
-      significant = abs(log2fc) > 0.5
-    )
-  
-  p2b <- ggplot(motif_wide, aes(x = Ctrl, y = ALS)) +
-    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray60") +
-    geom_point(aes(color = significant), alpha = 0.6, size = 2) +
-    geom_text(data = filter(motif_wide, significant), 
-              aes(label = motif), size = 2.5, vjust = -0.5, check_overlap = TRUE) +
-    scale_color_manual(values = c("TRUE" = "#E64B35", "FALSE" = "gray50")) +
-    labs(
-      title = "Motif Frequency: ALS vs Control",
-      x = "Control Frequency",
-      y = "ALS Frequency"
-    ) +
-    theme_pub() +
-    theme(legend.position = "none")
-} else {
-  p2b <- ggplot() + theme_void() + 
-    annotate("text", x = 0.5, y = 0.5, label = "Insufficient data")
-}
-
-# 2C: Heatmap of motif frequencies by sample
-motif_matrix <- motif_freq %>%
-  filter(motif %in% top_motifs) %>%
-  select(sample_id, motif, frequency) %>%
-  pivot_wider(names_from = motif, values_from = frequency, values_fill = 0) %>%
-  column_to_rownames("sample_id") %>%
-  as.matrix()
-
-# Simple heatmap with ggplot
-motif_heatmap_df <- motif_freq %>%
-  filter(motif %in% top_motifs) %>%
-  mutate(motif = factor(motif, levels = top_motifs))
-
-p2c <- ggplot(motif_heatmap_df, aes(x = motif, y = sample_id, fill = frequency)) +
-  geom_tile() +
-  scale_fill_viridis_c(option = "magma") +
-  facet_grid(group ~ ., scales = "free_y", space = "free_y") +
-  labs(
-    title = "End Motif Frequencies",
-    x = "Motif",
-    y = "Sample",
-    fill = "Frequency"
-  ) +
-  theme_pub() +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
-    axis.text.y = element_text(size = 7)
-  )
-
-# Combine motif plots
-p2_combined <- (p2a | p2b) / p2c +
-  plot_annotation(tag_levels = "A") +
-  plot_layout(heights = c(1, 1.2))
-
-ggsave(file.path(FIG_DIR, "fig2_end_motifs.pdf"), 
-       p2_combined, width = 12, height = 10, dpi = 300)
-ggsave(file.path(FIG_DIR, "fig2_end_motifs.png"), 
-       p2_combined, width = 12, height = 10, dpi = 300)
 
 # =============================================================================
 # Figure 3: Methylation QC
