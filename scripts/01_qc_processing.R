@@ -628,6 +628,7 @@ is_metrics <- ggplot(metric_long, aes(x = Group, y = value, fill = Group)) +
   scale_fill_manual(values = COLORS) +
   scale_color_manual(values = COLORS) +
   facet_wrap(~metric, scales = "free_y", ncol = 3) +
+  stat_compare_means(method = "t.test", label.x = 1.5, label.y = 1.05) +
   labs(
     title = "Insert size metrics",
     x = NULL,

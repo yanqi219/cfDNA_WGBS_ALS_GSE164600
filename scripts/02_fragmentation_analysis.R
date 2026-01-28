@@ -167,7 +167,7 @@ stop_if_missing_fragments(metadata$sample_id, FRAG_DIR)
 fragment_paths <- file.path(FRAG_DIR, paste0(metadata$sample_id, ".fragments.bed.gz"))
 names(fragment_paths) <- metadata$sample_id
 
-# 1) Genome-binned fragment size coverage + short/long ratio tracks ----
+# Figure 3: Genome-binned fragment size coverage + short/long ratio tracks ----
 message("Computing genome-binned fragmentation ratio tracks (short vs long)...")
 
 bin_size <- 2e6
@@ -313,7 +313,7 @@ p_tracks <- ggplot(bin_tracks_summary, aes(x = genome_x, y = median_short_long_r
   )
 
 ggsave(
-  file.path(FIG_DIR, "fig4_fragmentation_ratio_tracks.png"),
+  file.path(FIG_DIR, "fig3_fragmentation_ratio_tracks.png"),
   p_tracks,
   width = 16, height = 6, dpi = 300
 )
@@ -383,7 +383,7 @@ suppressPackageStartupMessages(library(Gviz))
   if (!is.null(ideo_track)) tracks <- c(list(ideo_track), tracks)
 
   png(
-    file.path(FIG_DIR, "fig4_fragmentation_ratio_tracks_gviz.png"),
+    file.path(FIG_DIR, "fig3_fragmentation_ratio_tracks_gviz.png"),
     width = 2400,
     height = if (!is.null(ideo_track)) 900 else 700,
     res = 300
@@ -392,20 +392,17 @@ suppressPackageStartupMessages(library(Gviz))
     tracks,
     from = from_bp,
     to = to_bp,
-    main = "Fragmentation ratio track (ALS/Ctrl)",
+    # main = "Fragmentation ratio track (ALS/Ctrl)",
     background.title = "white",
     col.title = "black",
-    cex.title = 0.20,
+    cex.title = 0.95,
     background.panel = "white",
     col.axis = "black",
     col.frame = "gray85"
   )
   dev.off()
 
-# =============================================================================
-# 3) Nucleosome positioning proxy: TSS-centered midpoint density ----
-# =============================================================================
-
+# 2) Nucleosome positioning proxy: TSS-centered midpoint density ----
 message("Computing TSS-centered nucleosome positioning profiles...")
 
 ensure_txdb <- function() {
