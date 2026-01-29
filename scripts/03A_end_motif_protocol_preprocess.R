@@ -16,7 +16,7 @@
 #
 # Notes for this project:
 # - We start from gzipped fragment BEDs produced by `scripts/01_qc_processing.R`:
-#     chrom, start0, end0, name, mapq, strand, length_bp
+#     chrom, start0, end0, name, mapq, strand, length_bp, gc
 #   where start0 = fragment start (0-based), end0 = fragment end (1-based inclusive)
 #   so that length_bp == end0 - start0.
 # - We do not require external `bedtools`/FASTA files: we use BSgenome hg38 (already used elsewhere).
@@ -119,7 +119,7 @@ gc.correct <- function(coverage, bias) {
 }
 
 ## --- Fragment reader (chunked; works for .gz and plain files) ---
-FRAG_COLS <- c("chrom", "start0", "end0", "name", "mapq", "strand", "length_bp")
+FRAG_COLS <- c("chrom", "start0", "end0", "name", "mapq", "strand", "length_bp", "gc")
 FRAG_COL_CLASSES <- c(
   chrom = "character",
   start0 = "integer",
@@ -127,7 +127,8 @@ FRAG_COL_CLASSES <- c(
   name = "character",
   mapq = "integer",
   strand = "character",
-  length_bp = "integer"
+  length_bp = "integer",
+  gc = "numeric"
 )
 
 read_fragments_chunked <- function(path, chunk_size, FUN) {

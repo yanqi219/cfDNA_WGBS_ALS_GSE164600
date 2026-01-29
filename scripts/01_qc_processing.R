@@ -33,10 +33,10 @@ install_and_load <- function(pkg, bioc=FALSE) {
 
 cran_pkgs <- c(
   "ggplot2", "dplyr", "tidyr", "readr", "purrr", "stringr", "tibble",
-  "caret", "pROC", "patchwork", "here", "parallel"
+  "caret", "pROC", "patchwork", "here", "parallel", "ggpubr"
 )
 bioc_pkgs <- c(
-  "Rsamtools", "GenomicAlignments", "GenomicRanges", "IRanges",
+  "Rsamtools", "cigarillo", "GenomicRanges", "IRanges",
   "Biostrings", "BSgenome.Hsapiens.UCSC.hg38"
 )
 invisible(lapply(cran_pkgs, install_and_load, bioc = FALSE))
@@ -50,7 +50,7 @@ RESULTS_DIR <- file.path(PROJECT_DIR, "cfDNA_WGBS_ALS_GSE164600/results")
 FIG_DIR <- file.path(RESULTS_DIR, "figures")
 TABLE_DIR <- file.path(RESULTS_DIR, "tables")
 FRAG_DIR <- file.path(DATA_DIR, "processed", "fragments")
-BEDPE_DIR <- file.path(DATA_DIR, "processed", "bedpe")
+
 # Create output dir
 if (!dir.exists(RESULTS_DIR)) {
   dir.create(RESULTS_DIR, recursive = TRUE, showWarnings = FALSE)
@@ -63,9 +63,6 @@ if (!dir.exists(TABLE_DIR)) {
 }
 if (!dir.exists(FRAG_DIR)) {
   dir.create(FRAG_DIR, recursive = TRUE, showWarnings = FALSE)
-}
-if (!dir.exists(BEDPE_DIR)) {
-  dir.create(BEDPE_DIR, recursive = TRUE, showWarnings = FALSE)
 }
 
 # Load sample metadata
@@ -225,17 +222,11 @@ extract_bam_metrics <- function(bam_path, sample_id, genome, chunk_size = 1e6, f
   meth_calls <- list()
   total_reads <- 0
   mapq_values <- integer()
+  gc_values <- numeric()
 
-  # Output files (protocol-faithful): write BEDPE first, then derive fragment BED from BEDPE.
-  # BEDPE format matches `bedtools bamtobed -bedpe` coordinate conventions:
-  # - start = 0-based, end = 0-based exclusive
-  # - columns: chrom1 start1 end1 chrom2 start2 end2 name score strand1 strand2
-  bedpe_path <- file.path(BEDPE_DIR, paste0(sample_id, ".bedpe.gz"))
-  bedpe_con <- gzfile(bedpe_path, open = "wt")
-  on.exit(try(close(bedpe_con), silent = TRUE), add = TRUE)
-
+  # Output files: fragment BED.
   # Fragment BED consumed by downstream scripts in this repo:
-  # chrom, start0, end0, name, mapq, strand, length_bp
+  # chrom, start0, end0, name, mapq, strand, length_bp, gc
   # where start0 is 0-based, end0 is compatible with 1-based inclusive coordinate for BSgenome
   # conversion via: start1 = start0 + 1; end1 = end0; and length_bp == end0 - start0.
   fragment_bed_path <- file.path(frag_dir, paste0(sample_id, ".fragments.bed.gz"))
@@ -301,7 +292,7 @@ extract_bam_metrics <- function(bam_path, sample_id, genome, chunk_size = 1e6, f
         aln <- aln %>%
           dplyr::mutate(
             start0 = pos - 1L,
-            end0_excl = start0 + as.integer(GenomicAlignments::cigarWidthAlongReferenceSpace(cigar)),
+            end0_excl = start0 + as.integer(cigarillo::cigar_extent_along_ref(cigar)),
             strand = dplyr::if_else(bitwAnd(flag, 16L) > 0L, "-", "+")
           ) %>%
           dplyr::filter(is.finite(start0), is.finite(end0_excl), end0_excl > start0)
@@ -323,40 +314,48 @@ extract_bam_metrics <- function(bam_path, sample_id, genome, chunk_size = 1e6, f
           # Order mates to mimic bedtools BEDPE ordering:
           # - if same chrom: smaller start0 first
           # - else: lexicographically lower chrom first
-          pair_rows <- pair_rows %>%
-            dplyr::group_by(qname) %>%
-            dplyr::mutate(
-              mate_raw = dplyr::row_number(),
-              swap = dplyr::if_else(
-                rname[1] == rname[2],
-                start0[1] > start0[2],
-                rname[1] > rname[2]
-              ),
-              mate = dplyr::if_else(swap, 3L - mate_raw, mate_raw)
-            ) %>%
-            dplyr::ungroup()
+          # Fast mate ordering + wide reshape (assumes exactly 2 rows per qname).
+          # This replaces group_by()/mutate()/pivot_wider(), which are slow in tight loops.
+          pair_rows <- pair_rows[order(pair_rows$qname), , drop = FALSE]
+          mate_raw <- stats::ave(pair_rows$qname, pair_rows$qname, FUN = seq_along) # 1,2 within each qname
 
-          pair_w <- pair_rows %>%
-            dplyr::select(qname, mate, rname, start0, end0_excl, mapq, strand) %>%
-            tidyr::pivot_wider(
-              names_from = mate,
-              values_from = c(rname, start0, end0_excl, mapq, strand),
-              names_sep = "_"
-            ) %>%
-            dplyr::filter(!is.na(rname_1) & !is.na(rname_2))
+          idx1 <- which(mate_raw == 1L)
+          idx2 <- which(mate_raw == 2L)
+
+          # Determine swap per pair (bedtools-style):
+          # - same chrom: smaller start first
+          # - else: lexicographically lower chrom first
+          same_chr <- pair_rows$rname[idx1] == pair_rows$rname[idx2]
+          swap_per_pair <- ifelse(
+            same_chr,
+            pair_rows$start0[idx1] > pair_rows$start0[idx2],
+            pair_rows$rname[idx1] > pair_rows$rname[idx2]
+          )
+
+          i1 <- ifelse(swap_per_pair, idx2, idx1)
+          i2 <- ifelse(swap_per_pair, idx1, idx2)
+
+          pair_w <- tibble::tibble(
+            qname = pair_rows$qname[idx1],
+            rname_1 = pair_rows$rname[i1],
+            start0_1 = pair_rows$start0[i1],
+            end0_excl_1 = pair_rows$end0_excl[i1],
+            mapq_1 = pair_rows$mapq[i1],
+            strand_1 = pair_rows$strand[i1],
+            rname_2 = pair_rows$rname[i2],
+            start0_2 = pair_rows$start0[i2],
+            end0_excl_2 = pair_rows$end0_excl[i2],
+            mapq_2 = pair_rows$mapq[i2],
+            strand_2 = pair_rows$strand[i2]
+          ) %>%
+            dplyr::filter(!is.na(.data$rname_1) & !is.na(.data$rname_2))
+
+          pair_w <- pair_w %>% dplyr::arrange(rname_1, start0_1)
 
           if (nrow(pair_w) > 0) {
             score <- pmin(pair_w$mapq_1, pair_w$mapq_2)
 
-            bedpe_lines <- paste(
-              pair_w$rname_1, pair_w$start0_1, pair_w$end0_excl_1,
-              pair_w$rname_2, pair_w$start0_2, pair_w$end0_excl_2,
-              pair_w$qname, score, pair_w$strand_1, pair_w$strand_2,
-              sep = "\t"
-            )
-            writeLines(bedpe_lines, con = bedpe_con, useBytes = TRUE)
-
-            # Derive fragment BED intervals from BEDPE (same-chrom pairs only)
+            # Derive fragment BED intervals
             same_chr <- pair_w$rname_1 == pair_w$rname_2
             if (any(same_chr)) {
               # Protocol-faithful "BEDPE -> fragment" definition:
@@ -369,6 +368,27 @@ extract_bam_metrics <- function(bam_path, sample_id, genome, chunk_size = 1e6, f
               # Keep "reasonable" fragment sizes for downstream plots/metrics
               keep_len <- is.finite(length_bp) & length_bp > 0L & length_bp <= 1000L
               if (any(keep_len)) {
+                # GC content (bedtools nuc convention): (G+C) / (A+C+G+T), excluding Ns.
+                gc <- rep(NA_real_, sum(keep_len))
+                gr_frag <- GenomicRanges::GRanges(
+                  seqnames = pair_w$rname_1[same_chr][keep_len],
+                  ranges = IRanges::IRanges(
+                    start = as.integer(frag_start0[keep_len] + 1L),
+                    end = as.integer(frag_end0[keep_len])
+                  ),
+                  strand = "*"
+                )
+
+                gc <- tryCatch({
+                  seqs <- BSgenome::getSeq(genome, gr_frag)
+                  acgt <- Biostrings::letterFrequency(seqs, letters = c("A", "C", "G", "T"), as.prob = FALSE)
+                  denom <- rowSums(acgt)
+                  num_gc <- acgt[, "C"] + acgt[, "G"]
+                  ifelse(denom > 0, num_gc / denom, NA_real_)
+                }, error = function(e) {
+                  rep(NA_real_, length(gr_frag))
+                })
+
                 frag_lines <- paste(
                   pair_w$rname_1[same_chr][keep_len],
                   as.integer(frag_start0[keep_len]),
@@ -377,10 +397,12 @@ extract_bam_metrics <- function(bam_path, sample_id, genome, chunk_size = 1e6, f
                   as.integer(score[same_chr][keep_len]),
                   pair_w$strand_1[same_chr][keep_len],
                   as.integer(length_bp[keep_len]),
+                  formatC(gc, format = "f", digits = 4),
                   sep = "\t"
                 )
                 writeLines(frag_lines, con = frag_con, useBytes = TRUE)
                 frag_lengths <- c(frag_lengths, as.integer(length_bp[keep_len]))
+                gc_values <- c(gc_values, gc)
               }
             }
           }
@@ -416,10 +438,10 @@ extract_bam_metrics <- function(bam_path, sample_id, genome, chunk_size = 1e6, f
   list(
     sample_id = sample_id,
     fragment_bed = fragment_bed_path,
-    bedpe = bedpe_path,
     flagstat = flagstat,
     filtered_reads = total_reads,  # Reads passing quality filters
     fragment_lengths = frag_lengths,
+    gc_content = gc_values,
     mapq = mapq_values,
     methylation = meth_summary
   )
@@ -449,6 +471,7 @@ calculate_summary_stats <- function(metrics) {
   }
 
   fl <- metrics$fragment_lengths
+  gc <- metrics$gc_content
   meth <- metrics$methylation
   fs <- metrics$flagstat
 
@@ -477,6 +500,7 @@ calculate_summary_stats <- function(metrics) {
     filtered_reads = metrics$filtered_reads,
     filter_pass_rate = metrics$filtered_reads / fs$total_reads,
     # Fragment length statistics
+    gc_content = mean(gc, na.rm = TRUE),
     n_fragments = length(fl),
     mean_frag_length = mean(fl),
     median_frag_length = median(fl),
@@ -534,7 +558,8 @@ key_metrics <- summary_stats %>%
     median_frag_length,
     mean_mapq,
     cpg_methylation,
-    bisulfite_conversion
+    bisulfite_conversion,
+    gc_content
   ) %>%
   dplyr::mutate(
     total_reads_m = total_reads / 1e6,
@@ -549,6 +574,7 @@ key_metrics_by_group <- key_metrics %>%
     n_samples = dplyr::n(),
     total_reads_m_mean = mean(total_reads_m, na.rm = TRUE),
     filtered_reads_m_mean = mean(filtered_reads_m, na.rm = TRUE),
+    gc_content_mean = mean(gc_content, na.rm = TRUE),
     median_frag_length_mean = mean(median_frag_length, na.rm = TRUE),
     mean_mapq_mean = mean(mean_mapq, na.rm = TRUE),
     cpg_methylation_pct_mean = mean(cpg_methylation_pct, na.rm = TRUE),
@@ -560,7 +586,7 @@ message("\n================ QC key metrics (per sample) ================\n")
 print(
   key_metrics %>%
     dplyr::arrange(Group, dplyr::desc(filtered_reads)) %>%
-    dplyr::select(sample_id, Group, total_reads, filtered_reads, median_frag_length, mean_mapq, cpg_methylation, bisulfite_conversion)
+    dplyr::select(sample_id, Group, total_reads, filtered_reads, median_frag_length, mean_mapq, cpg_methylation, bisulfite_conversion, gc_content)
 )
 
 message("\n================ QC key metrics (by group) ================\n")
@@ -568,9 +594,9 @@ print(key_metrics_by_group)
 
 ## plot ----
 key_metrics_long_sample <- key_metrics %>%
-  dplyr::select(sample_id, Group, total_reads_m, filtered_reads_m, median_frag_length, mean_mapq, cpg_methylation_pct, bisulfite_conversion_pct) %>%
+  dplyr::select(sample_id, Group, total_reads_m, filtered_reads_m, median_frag_length, mean_mapq, cpg_methylation_pct, bisulfite_conversion_pct, gc_content) %>%
   tidyr::pivot_longer(
-    cols = c(total_reads_m, filtered_reads_m, median_frag_length, mean_mapq, cpg_methylation_pct, bisulfite_conversion_pct),
+    cols = c(total_reads_m, filtered_reads_m, median_frag_length, mean_mapq, cpg_methylation_pct, bisulfite_conversion_pct, gc_content),
     names_to = "metric",
     values_to = "value"
   ) %>%
@@ -585,8 +611,8 @@ key_metrics_long_sample <- key_metrics %>%
   dplyr::mutate(
     metric = factor(
       metric,
-      levels = c("total_reads_m", "filtered_reads_m", "median_frag_length", "mean_mapq", "cpg_methylation_pct", "bisulfite_conversion_pct"),
-      labels = c("Total reads (M)", "Filtered reads (M)", "Median fragment length (bp)", "Mean MAPQ", "CpG methylation (%)", "Bisulfite conversion (%)")
+      levels = c("total_reads_m", "filtered_reads_m", "mean_mapq", "median_frag_length", "gc_content", "cpg_methylation_pct", "bisulfite_conversion_pct"),
+      labels = c("Total reads (M)", "Filtered reads (M)", "Mean MAPQ", "Median fragment length (bp)", "GC content (%)", "CpG methylation (%)", "Bisulfite conversion (%)")
     )
   )
 
@@ -614,7 +640,8 @@ p_qc_group <- ggplot(
   aes(x = Group, y = value, fill = Group)
 ) +
   geom_boxplot(width = 0.55, outlier.shape = NA, alpha = 0.95) +
-  facet_wrap(~metric, scales = "free_y", ncol = 3) +
+  geom_jitter(width = 0.12, size = 1.8, alpha = 0.5) +
+  facet_wrap(~metric, scales = "free_y", ncol = 4) +
   scale_fill_manual(values = COLORS) +
   labs(
     title = "QCs by group",
@@ -622,14 +649,15 @@ p_qc_group <- ggplot(
     y = NULL
   ) +
   theme_pub(base_size = 12) +
-  theme(legend.position = "none")
+  theme(legend.position = "none") +
+  ggpubr::stat_compare_means(method = "t.test")
 
 p_qc_combined <- p_qc_group / p_qc_sample +
   plot_annotation(tag_levels = "A") +
   plot_layout(heights = c(1, 1.4))
 
 ggsave(file.path(FIG_DIR, "fig1_qc_key_metrics.png"),
-       p_qc_combined, width = 14, height = 16, dpi = 300)
+       p_qc_combined, width = 14, height = 18, dpi = 300)
 
 # Figure 2: Insert size (fragment length) QC ----
 frag_df <- map_dfr(all_metrics, function(m) {
@@ -690,7 +718,7 @@ is_metrics <- ggplot(metric_long, aes(x = Group, y = value, fill = Group)) +
   scale_fill_manual(values = COLORS) +
   scale_color_manual(values = COLORS) +
   facet_wrap(~metric, scales = "free_y", ncol = 3) +
-  stat_compare_means(method = "t.test", label.x = 1.5, label.y = 1.05) +
+  ggpubr::stat_compare_means(method = "t.test") +
   labs(
     title = "Insert size metrics",
     x = NULL,
@@ -742,7 +770,7 @@ is_saw <- ggplot(counts_saw, aes(x = fragment_length, y = n)) +
     axis.text = element_text(size = 8)
   )
 
-# Group-level median fragment size distributions ----
+### Group-level median fragment size distributions ----
 len_min <- 30L
 len_max <- 500L
 len_grid <- len_min:len_max
