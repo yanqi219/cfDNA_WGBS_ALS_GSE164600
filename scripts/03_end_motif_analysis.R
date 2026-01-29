@@ -7,37 +7,56 @@
 # - start0 is 0-based
 # - end0 is end-exclusive (BED). length_bp == end0 - start0.
 #
-# Motif extraction:
-# - left 5' end:  [start0, start0+4) on strand "+"
-# - right 5' end: [end0-4, end0) on strand "-" (getSeq returns reverse-complement)
+# Motif extraction (standard cfDNA end-motif definition; strand-aware):
+# - left genomic end:  [start0, start0+4) on strand "+"
+# - right genomic end: [end0-4, end0) on strand "-" (getSeq returns reverse-complement)
+# -> two 4-mers per fragment.
 #
-# Outputs:
-# - results/figures/fig4A_end_motif_4mer_clustering_heatmap.pdf/png
-# - results/figures/fig4B_end_motif_mds.pdf/png
-# - results/figures/fig4D_end_motif_sequence_logo.pdf/png
-# - results/tables/end_motif_4mer_frequencies_long.csv
-# - results/tables/end_motif_mds.csv
+# Main outputs:
+# - fig4A_end_motif_4mer_clustering_heatmap.pdf/png
+# - fig4B_end_motif_mds.pdf/png
+# - fig4D_end_motif_sequence_logo.pdf/png
+# - fig4C_top20_end_motifs_barplot.pdf/png
+# - fig4E_end_motif_pca.pdf/png
+# - fig4F_end_motif_volcano.pdf/png
+#
+# Tables:
+# - end_motif_4mer_frequencies_long.csv
+# - end_motif_mds.csv
+# - end_motif_pca_scores.csv
+# - end_motif_differential_motifs.csv
 #
 # References (methods conventions):
-# - Liu et al., STAR Protocols (2024): cfDNA end motif workflow + row Z-score heatmap convention
+# - Liu et al., STAR Protocols (2024): workflow + row Z-score heatmap convention
 #   https://pmc.ncbi.nlm.nih.gov/articles/PMC11489062/
 # - Jiang et al., Cancer Discovery (2020): 256 4-mer end motif profiling
 
-suppressPackageStartupMessages(library(dplyr))
-suppressPackageStartupMessages(library(tidyr))
-suppressPackageStartupMessages(library(purrr))
-suppressPackageStartupMessages(library(tibble))
-suppressPackageStartupMessages(library(readr))
-suppressPackageStartupMessages(library(here))
-suppressPackageStartupMessages(library(ggplot2))
-suppressPackageStartupMessages(library(ComplexHeatmap))
-suppressPackageStartupMessages(library(circlize))
-suppressPackageStartupMessages(library(patchwork))
-suppressPackageStartupMessages(library(GenomicRanges))
-suppressPackageStartupMessages(library(IRanges))
-suppressPackageStartupMessages(library(Biostrings))
-suppressPackageStartupMessages(library(BSgenome.Hsapiens.UCSC.hg38))
-suppressPackageStartupMessages(library(ggseqlogo))
+# Function to install and load packages if missing
+install_and_load <- function(pkg, bioc=FALSE) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (bioc) {
+      if (!requireNamespace("BiocManager", quietly = TRUE)) {
+        install.packages("BiocManager")
+      }
+      BiocManager::install(pkg, ask = FALSE, update = FALSE)
+    } else {
+      install.packages(pkg)
+    }
+  }
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}
+
+cran_pkgs <- c(
+  "ggplot2", "tidyverse", "purrr", "stringr", "tibble",
+  "caret", "pROC", "patchwork", "here", "parallel", "ggpubr", "circlize"
+)
+bioc_pkgs <- c(
+  "Rsamtools", "cigarillo", "GenomicRanges", "IRanges", "ChIPseeker", "biomaRt", "org.Hs.eg.db", "AnnotationDbi",
+  "Biostrings", "BSgenome.Hsapiens.UCSC.hg38", "GenomeInfoDb", "TxDb.Hsapiens.UCSC.hg38.knownGene", "GenomicFeatures",
+  "ComplexHeatmap"
+)
+invisible(lapply(cran_pkgs, install_and_load, bioc = FALSE))
+invisible(lapply(bioc_pkgs, install_and_load, bioc = TRUE))
 
 # Paths ----
 PROJECT_DIR <- here::here()
@@ -53,7 +72,7 @@ if (!dir.exists(TABLE_DIR)) dir.create(TABLE_DIR, recursive = TRUE, showWarnings
 
 # Input ----
 metadata <- readr::read_csv(file.path(DATA_DIR, "sample_metadata.csv"), show_col_types = FALSE) %>%
-  mutate(Group = factor(Group, levels = c("Ctrl", "ALS")))
+  mutate(Group = factor(.data$Group, levels = c("Ctrl", "ALS")))
 
 genome <- BSgenome.Hsapiens.UCSC.hg38
 valid_seqnames <- seqnames(genome)
@@ -96,28 +115,6 @@ shannon_entropy_bits <- function(p) {
   -sum(p * log2(p))
 }
 
-logo_pwm_from_counts <- function(df_counts) {
-  bases <- c("A", "C", "G", "T")
-  df_counts <- df_counts %>%
-    mutate(motif = toupper(.data$motif)) %>%
-    filter(nchar(.data$motif) == 4, grepl("^[ACGT]{4}$", .data$motif), .data$count > 0)
-
-  total <- sum(df_counts$count)
-  if (!is.finite(total) || total <= 0) {
-    return(matrix(0.25, nrow = 4, ncol = 4, dimnames = list(bases, 1:4)))
-  }
-
-  m <- matrix(0, nrow = 4, ncol = 4, dimnames = list(bases, 1:4))
-  for (pos in 1:4) {
-    b <- substr(df_counts$motif, pos, pos)
-    v <- tapply(df_counts$count, b, sum)
-    base_counts <- setNames(rep(0, length(bases)), bases)
-    base_counts[names(v)] <- as.numeric(v)
-    m[, pos] <- unname(base_counts[bases])
-  }
-  m / total
-}
-
 FRAG_COLS <- c("chrom", "start0", "end0", "name", "mapq", "strand", "length_bp", "gc")
 FRAG_COL_CLASSES <- c(
   chrom = "character",
@@ -145,7 +142,6 @@ read_frag_chunk <- function(con, chunk_size) {
 
 extract_4mer_counts_from_frag_bed <- function(frag_bed_gz, sample_id, genome, valid_seqnames, motifs_all, chunk_size = 200000L) {
   counts <- setNames(integer(length(motifs_all)), motifs_all)
-
   con <- gzfile(frag_bed_gz, open = "rt")
   on.exit(try(close(con), silent = TRUE), add = TRUE)
 
@@ -155,7 +151,6 @@ extract_4mer_counts_from_frag_bed <- function(frag_bed_gz, sample_id, genome, va
     x <- tryCatch(read_frag_chunk(con, chunk_size), error = function(e) NULL)
     if (is.null(x) || nrow(x) == 0) break
 
-    # Keep only seqnames present in hg38 to avoid getSeq() failing a whole chunk.
     x <- x %>%
       filter(
         .data$chrom %in% valid_seqnames,
@@ -166,14 +161,12 @@ extract_4mer_counts_from_frag_bed <- function(frag_bed_gz, sample_id, genome, va
       )
     if (nrow(x) == 0) next
 
-    # left end: start0..start0+4
     gr_l <- GRanges(
       seqnames = x$chrom,
       ranges = IRanges(start = x$start0 + 1L, width = 4L),
       strand = "+"
     )
 
-    # right end: end0-4..end0 on "-" (reverse-complemented)
     r_start0 <- x$end0 - 4L
     keep_r <- is.finite(r_start0) & r_start0 >= 0L
     gr_r <- GRanges(
@@ -182,7 +175,6 @@ extract_4mer_counts_from_frag_bed <- function(frag_bed_gz, sample_id, genome, va
       strand = "-"
     )
 
-    # Fetch sequences (strand-aware) and count valid 4-mers
     s_l <- getSeq(genome, gr_l)
     s_r <- if (length(gr_r) > 0) getSeq(genome, gr_r) else DNAStringSet()
 
@@ -205,16 +197,16 @@ extract_4mer_counts_from_frag_bed <- function(frag_bed_gz, sample_id, genome, va
   tibble(sample_id = sample_id, motif = names(counts), count = as.integer(counts))
 }
 
-# Build 256-motif counts per sample ----
+# Build motif counts ----
 motifs_all <- all_4mers()
 
 sample_frag_paths <- metadata %>%
   transmute(
-    sample_id = sample_id,
-    frag_bed = file.path(FRAG_DIR, paste0(sample_id, ".fragments.bed.gz"))
+    sample_id = .data$sample_id,
+    frag_bed = file.path(FRAG_DIR, paste0(.data$sample_id, ".fragments.bed.gz"))
   )
 
-missing <- sample_frag_paths %>% filter(!file.exists(frag_bed))
+missing <- sample_frag_paths %>% filter(!file.exists(.data$frag_bed))
 if (nrow(missing) > 0) stop("Missing fragment BED(s):\n", paste(missing$frag_bed, collapse = "\n"))
 
 message("Extracting 4-mer end motifs from fragment BEDs (two 5' ends per fragment).")
@@ -228,37 +220,32 @@ motif_long <- motif_counts %>%
   left_join(metadata, by = "sample_id") %>%
   group_by(sample_id) %>%
   mutate(
-    total = sum(count),
-    frequency = ifelse(total > 0, count / total, 0)
+    total = sum(.data$count),
+    frequency = ifelse(.data$total > 0, .data$count / .data$total, 0)
   ) %>%
   ungroup()
 
 readr::write_csv(
-  motif_long %>% select(sample_id, Group, motif, count, frequency),
+  motif_long,
   file.path(TABLE_DIR, "end_motif_4mer_frequencies_long.csv")
 )
 
 freq_mat <- motif_long %>%
-  select(motif, sample_id, frequency) %>%
-  pivot_wider(names_from = sample_id, values_from = frequency, values_fill = 0) %>%
-  column_to_rownames("motif") %>%
+  dplyr::select(motif, sample_id, frequency) %>%
+  tidyr::pivot_wider(names_from = sample_id, values_from = frequency, values_fill = 0) %>%
+  tibble::column_to_rownames("motif") %>%
   as.matrix()
 
-sample_order <- metadata %>% arrange(Group, sample_id) %>% pull(sample_id)
-freq_mat <- freq_mat[, intersect(sample_order, colnames(freq_mat)), drop = FALSE]
+freq_mat <- freq_mat[, match(metadata$sample_id, colnames(freq_mat))]
 
-# =============================================================================
-# Additional analyses: Top motifs, PCA, differential motifs
-# =============================================================================
-
-# 1) Top 20 motif frequencies by group (bar plot) ----
+# Top 20 motif frequencies by group ----
 motif_summary <- motif_long %>%
-  group_by(Group, motif) %>%
-  summarise(mean_freq = mean(frequency), sd_freq = sd(frequency), .groups = "drop")
+  dplyr::group_by(Group, motif) %>%
+  dplyr::summarise(mean_freq = mean(frequency), sd_freq = sd(frequency), .groups = "drop")
 
 top20 <- motif_summary %>%
-  group_by(motif) %>%
-  summarise(total_mean = sum(mean_freq), .groups = "drop") %>%
+  dplyr::group_by(motif) %>%
+  dplyr::summarise(total_mean = sum(mean_freq), .groups = "drop") %>%
   arrange(desc(total_mean)) %>%
   slice_head(n = 20) %>%
   pull(motif)
@@ -280,114 +267,10 @@ p_top20 <- motif_summary %>%
   theme_pub(base_size = 12) +
   theme(legend.position = "top")
 
-ggsave(file.path(FIG_DIR, "fig4C_top20_end_motifs_barplot.pdf"),
-       p_top20, width = 7.8, height = 5.2, dpi = 300, device = grDevices::cairo_pdf)
-ggsave(file.path(FIG_DIR, "fig4C_top20_end_motifs_barplot.png"),
+ggsave(file.path(FIG_DIR, "fig5A_top20_end_motifs_barplot.png"),
        p_top20, width = 7.8, height = 5.2, dpi = 450)
 
-# 2) PCA of samples based on 256 motif frequencies ----
-# Common practice: log-transform with pseudocount then PCA (stabilizes compositional variability).
-X <- t(freq_mat) # samples x motifs
-X <- log10(X + 1e-6)
-pca <- prcomp(X, center = TRUE, scale. = TRUE)
-
-pca_df <- as.data.frame(pca$x[, 1:2, drop = FALSE]) %>%
-  tibble::rownames_to_column("sample_id") %>%
-  left_join(metadata, by = "sample_id")
-
-var_expl <- (pca$sdev^2) / sum(pca$sdev^2)
-pc1_lab <- sprintf("PC1 (%.1f%%)", 100 * var_expl[1])
-pc2_lab <- sprintf("PC2 (%.1f%%)", 100 * var_expl[2])
-
-readr::write_csv(pca_df, file.path(TABLE_DIR, "end_motif_pca_scores.csv"))
-
-p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Group)) +
-  geom_point(size = 3, alpha = 0.9) +
-  stat_ellipse(type = "norm", level = 0.68, linewidth = 0.6, alpha = 0.2) +
-  scale_color_manual(values = COLORS) +
-  labs(
-    title = "PCA of samples using 256 end-motif frequencies",
-    x = pc1_lab,
-    y = pc2_lab,
-    color = "Group"
-  ) +
-  theme_pub(base_size = 12) +
-  theme(legend.position = "top")
-
-ggsave(file.path(FIG_DIR, "fig4E_end_motif_pca.pdf"),
-       p_pca, width = 6.8, height = 5.6, dpi = 300, device = grDevices::cairo_pdf)
-ggsave(file.path(FIG_DIR, "fig4E_end_motif_pca.png"),
-       p_pca, width = 6.8, height = 5.6, dpi = 450)
-
-# 3) Differential motif analysis + volcano plot ----
-# Best practice: non-parametric per-motif comparison across groups + BH FDR.
-eps <- 1e-6
-diff_tbl <- motif_long %>%
-  select(Group, motif, frequency) %>%
-  group_by(motif) %>%
-  summarise(
-    mean_Ctrl = mean(frequency[Group == "Ctrl"]),
-    mean_ALS = mean(frequency[Group == "ALS"]),
-    log2fc = log2((mean_ALS + eps) / (mean_Ctrl + eps)),
-    p = if (dplyr::n_distinct(Group) < 2) NA_real_ else wilcox.test(frequency ~ Group)$p.value,
-    .groups = "drop"
-  ) %>%
-  mutate(
-    padj = p.adjust(p, method = "BH"),
-    neglog10_padj = -log10(padj)
-  )
-
-readr::write_csv(diff_tbl, file.path(TABLE_DIR, "end_motif_differential_motifs.csv"))
-
-sig_cut <- 0.05
-lfc_cut <- 0.5
-diff_tbl <- diff_tbl %>%
-  mutate(
-    status = case_when(
-      !is.na(padj) & padj < sig_cut & log2fc > lfc_cut ~ "Higher in ALS",
-      !is.na(padj) & padj < sig_cut & log2fc < -lfc_cut ~ "Higher in Ctrl",
-      TRUE ~ "Not significant"
-    )
-  )
-
-label_tbl <- diff_tbl %>%
-  filter(status != "Not significant") %>%
-  arrange(padj) %>%
-  slice_head(n = 10)
-
-p_volcano <- ggplot(diff_tbl, aes(x = log2fc, y = neglog10_padj)) +
-  geom_hline(yintercept = -log10(sig_cut), linetype = "dashed", color = "gray60", linewidth = 0.4) +
-  geom_vline(xintercept = c(-lfc_cut, lfc_cut), linetype = "dashed", color = "gray60", linewidth = 0.4) +
-  geom_point(aes(color = status), alpha = 0.85, size = 2.2) +
-  geom_text(
-    data = label_tbl,
-    aes(label = motif),
-    size = 3,
-    vjust = -0.7,
-    check_overlap = TRUE
-  ) +
-  scale_color_manual(
-    values = c("Higher in ALS" = COLORS["ALS"], "Higher in Ctrl" = COLORS["Ctrl"], "Not significant" = "gray70")
-  ) +
-  labs(
-    title = "Differential end motifs (ALS vs Ctrl)",
-    subtitle = "Wilcoxon test per motif; BH FDR. Effect size = log2(mean freq ratio).",
-    x = "log2 fold-change (ALS / Ctrl)",
-    y = expression(-log[10]("FDR")),
-    color = NULL
-  ) +
-  theme_pub(base_size = 12) +
-  theme(legend.position = "top")
-
-ggsave(file.path(FIG_DIR, "fig4F_end_motif_volcano.pdf"),
-       p_volcano, width = 7.2, height = 5.6, dpi = 300, device = grDevices::cairo_pdf)
-ggsave(file.path(FIG_DIR, "fig4F_end_motif_volcano.png"),
-       p_volcano, width = 7.2, height = 5.6, dpi = 450)
-
-# =============================================================================
-# Figure 4A: Unsupervised hierarchical clustering heatmap (256 motifs)
-# =============================================================================
-
+# Unsupervised hierarchical clustering heatmap (256 motifs) ----
 z_mat <- t(scale(t(freq_mat)))
 z_mat[!is.finite(z_mat)] <- 0
 
@@ -422,20 +305,12 @@ ht <- Heatmap(
   )
 )
 
-grDevices::cairo_pdf(file.path(FIG_DIR, "fig4A_end_motif_4mer_clustering_heatmap.pdf"),
-                     width = 9.5, height = 9.5)
+png(file.path(FIG_DIR, "fig5B_end_motif_4mer_clustering_heatmap.png"),
+    width = 5000, height = 7000, res = 450)
 draw(ht, heatmap_legend_side = "right", annotation_legend_side = "right")
-invisible(dev.off())
+dev.off()
 
-png(file.path(FIG_DIR, "fig4A_end_motif_4mer_clustering_heatmap.png"),
-    width = 9.5, height = 9.5, units = "in", res = 450, type = "cairo-png")
-draw(ht, heatmap_legend_side = "right", annotation_legend_side = "right")
-invisible(dev.off())
-
-# =============================================================================
-# Figure 4B: Motif Diversity Score (MDS; Shannon entropy)
-# =============================================================================
-
+# Motif Diversity Score (MDS; Shannon entropy) ----
 mds_tbl <- tibble(sample_id = colnames(freq_mat)) %>%
   mutate(
     entropy_bits = apply(freq_mat, 2, shannon_entropy_bits),
@@ -449,7 +324,6 @@ p_mds <- ggplot(mds_tbl, aes(x = Group, y = mds, fill = Group)) +
   geom_boxplot(width = 0.55, outlier.shape = NA, alpha = 0.85) +
   geom_jitter(width = 0.12, size = 2.0, alpha = 0.75) +
   scale_fill_manual(values = COLORS) +
-  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.1)) +
   labs(
     title = "End-motif diversity (MDS)",
     subtitle = "Shannon entropy of 256 4-mer frequencies (normalized by log2(256))",
@@ -459,44 +333,121 @@ p_mds <- ggplot(mds_tbl, aes(x = Group, y = mds, fill = Group)) +
   theme_pub(base_size = 12) +
   theme(legend.position = "none")
 
-ggsave(file.path(FIG_DIR, "fig4B_end_motif_mds.pdf"),
-       p_mds, width = 6.2, height = 4.8, dpi = 300, device = grDevices::cairo_pdf)
-ggsave(file.path(FIG_DIR, "fig4B_end_motif_mds.png"),
-       p_mds, width = 6.2, height = 4.8, dpi = 450)
+ggsave(file.path(FIG_DIR, "fig5C_end_motif_mds.png"),
+       p_mds, width = 8, height = 7, dpi = 450)
 
-# =============================================================================
-# Figure 4D: Sequence logos (pooled within group)
-# =============================================================================
+# PCA on samples using 256 motif frequencies ----
+X <- t(freq_mat) # samples x motifs
+X <- log10(X + 1e-6)
+pca <- prcomp(X, center = TRUE, scale. = TRUE)
 
-group_counts <- motif_long %>%
-  group_by(Group, motif) %>%
-  summarise(count = sum(count), .groups = "drop")
+pca_df <- as.data.frame(pca$x[, 1:2, drop = FALSE]) %>%
+  tibble::rownames_to_column("sample_id") %>%
+  left_join(metadata, by = "sample_id")
 
-pwm_by_group <- group_counts %>%
-  split(.$Group) %>%
-  lapply(logo_pwm_from_counts)
+var_expl <- (pca$sdev^2) / sum(pca$sdev^2)
+pc1_lab <- sprintf("PC1 (%.1f%%)", 100 * var_expl[1])
+pc2_lab <- sprintf("PC2 (%.1f%%)", 100 * var_expl[2])
 
-logo_plots <- lapply(names(pwm_by_group), function(g) {
-  ggseqlogo::ggseqlogo(pwm_by_group[[g]], method = "prob", seq_type = "dna") +
-    labs(title = g, x = "Position", y = "Probability") +
-    theme_pub(base_size = 12) +
-    theme(
-      plot.title = element_text(hjust = 0.5),
-      panel.grid.major = element_blank(),
-      panel.grid.minor = element_blank()
-    )
-})
+p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Group, label = sample_id)) +
+  geom_point(size = 3, alpha = 0.9) +
+  stat_ellipse(type = "norm", level = 0.68, linewidth = 0.6, alpha = 0.2) +
+  geom_text(size = 2.7, hjust = 0.5, vjust = -0.7, show.legend = FALSE, alpha = 0.88, check_overlap = TRUE) +
+  scale_color_manual(values = COLORS) +
+  labs(
+    title = "PCA of samples using 256 end-motif frequencies",
+    x = pc1_lab,
+    y = pc2_lab,
+    color = "Group"
+  ) +
+  theme_pub(base_size = 12) +
+  theme(legend.position = "top")
 
-p_logo <- wrap_plots(logo_plots, ncol = 1) +
-  plot_annotation(title = "cfDNA 5' end motif sequence logo (4-mer; pooled within group)") &
-  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = rel(1.2)))
+ggsave(file.path(FIG_DIR, "fig5D_end_motif_pca.png"),
+       p_pca, width = 8, height = 7, dpi = 450)
 
-ggsave(file.path(FIG_DIR, "fig4D_end_motif_sequence_logo.pdf"),
-       p_logo, width = 7.2, height = 6.8, dpi = 300, device = grDevices::cairo_pdf)
-ggsave(file.path(FIG_DIR, "fig4D_end_motif_sequence_logo.png"),
-       p_logo, width = 7.2, height = 6.8, dpi = 450)
+# Differential motifs + volcano ----
+eps <- 1e-6
+diff_tbl <- motif_long %>%
+  dplyr::select(Group, motif, frequency) %>%
+  group_by(motif) %>%
+  summarise(
+    mean_Ctrl = mean(frequency[Group == "Ctrl"]),
+    mean_ALS = mean(frequency[Group == "ALS"]),
+    log2fc = log2((mean_ALS + eps) / (mean_Ctrl + eps)),
+    p = if (dplyr::n_distinct(Group) < 2) NA_real_ else wilcox.test(frequency ~ Group)$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    padj = p.adjust(p, method = "BH"),
+    neglog10_padj = -log10(padj),
+    neglog10_p = -log10(p)
+  )
 
-message("Done.")
-message(sprintf("Figures: %s", FIG_DIR))
-message(sprintf("Tables:  %s", TABLE_DIR))
+readr::write_csv(diff_tbl, file.path(TABLE_DIR, "end_motif_differential_motifs.csv"))
 
+sig_cut <- 0.05
+lfc_cut <- 0.05
+diff_tbl <- diff_tbl %>%
+  mutate(
+    status = case_when(
+      !is.na(p) & p < sig_cut & log2fc > lfc_cut ~ "Higher in ALS",
+      !is.na(p) & p < sig_cut & log2fc < -lfc_cut ~ "Higher in Ctrl",
+      TRUE ~ "Not significant"
+    ),
+    status = factor(status, levels = c("Higher in ALS", "Higher in Ctrl", "Not significant"))
+  )
+
+label_tbl <- diff_tbl %>%
+  filter(status != "Not significant") %>%
+  arrange(p) %>%
+  slice_head(n = 10)
+
+p_volcano <- ggplot(diff_tbl, aes(x = log2fc, y = neglog10_p, color = status)) +
+  geom_hline(yintercept = -log10(sig_cut), linetype = "dashed", color = "gray60", linewidth = 0.4) +
+  geom_vline(xintercept = c(-lfc_cut, lfc_cut), linetype = "dashed", color = "gray60", linewidth = 0.4) +
+  geom_point(alpha = 0.85, size = 2.2) +
+  geom_text(
+    data = label_tbl,
+    aes(label = motif, color = status),
+    size = 3,
+    vjust = -0.7,
+    check_overlap = TRUE,
+    show.legend = FALSE
+  ) +
+  scale_color_manual(
+    values = c(
+      "Higher in ALS" = unname(COLORS["ALS"]),
+      "Higher in Ctrl" = unname(COLORS["Ctrl"]),
+      "Not significant" = "gray70"
+    ),
+    drop = FALSE
+  ) +
+  labs(
+    title = "Differential end motifs (ALS vs Ctrl)",
+    subtitle = "Wilcoxon test per motif",
+    x = "log2 fold-change (ALS / Ctrl)",
+    y = expression(-log[10]("FDR")),
+    color = NULL
+  ) +
+  theme_pub(base_size = 12) +
+  theme(legend.position = "top")
+
+ggsave(file.path(FIG_DIR, "fig5E_end_motif_volcano.png"),
+       p_volcano, width = 7.2, height = 5.6, dpi = 450)
+
+# Draw combined figure ----
+ht_grob <- grid::grid.grabExpr(
+  ComplexHeatmap::draw(ht, heatmap_legend_side = "right", annotation_legend_side = "right")
+)
+p_ht <- patchwork::wrap_elements(full = ht_grob)
+
+p_end_motif_combined <- (p_top20 | p_ht) / (p_mds | p_pca | p_volcano) +
+  plot_annotation(tag_levels = "A") +
+  plot_layout(heights = c(2.5, 1.6))
+
+ggsave(
+  file.path(FIG_DIR, "fig5_end_motif_analysis.png"),
+  p_end_motif_combined,
+  width = 18, height = 18, dpi = 300
+)

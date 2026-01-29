@@ -985,7 +985,6 @@ p_tss_muscle <- ggplot(tss_summary_m_s, aes(x = rel_bp, color = Group, fill = Gr
   theme_bw(base_size = 12) +
   theme(panel.grid.minor = element_blank(), legend.position = "top")
 
-
 p_tss_combined <- p_start_annot / p_tss_global / p_tss_muscle +
   plot_annotation(tag_levels = "A") +
   plot_layout(heights = c(1.4, 1, 1))
@@ -993,6 +992,6 @@ p_tss_combined <- p_start_annot / p_tss_global / p_tss_muscle +
 ggsave(
   file.path(FIG_DIR, "fig4_fragmentation_analysis.png"),
   p_tss_combined,
-  width = 14, height = 18, dpi = 300
+  width = 8, height = 5.5, dpi = 300
 )
 

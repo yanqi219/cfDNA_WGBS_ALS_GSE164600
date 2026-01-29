@@ -19,59 +19,36 @@
 # - sample IDs + BAM filenames are in: cfDNA_WGBS_ALS_GSE164600/data/sample_metadata.csv
 # - This dataset is downsampled to chr21; analysis will therefore focus on chr21.
 
-suppressPackageStartupMessages(library(here))
-suppressPackageStartupMessages(library(readr))
-suppressPackageStartupMessages(library(dplyr))
-suppressPackageStartupMessages(library(tidyr))
-suppressPackageStartupMessages(library(tibble))
-suppressPackageStartupMessages(library(purrr))
-suppressPackageStartupMessages(library(stringr))
-suppressPackageStartupMessages(library(ggplot2))
-suppressPackageStartupMessages(library(patchwork))
-suppressPackageStartupMessages(library(Rsamtools))
-
-ensure_bioc <- function(pkgs) {
-  missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
-  if (length(missing) == 0) return(invisible(TRUE))
-  stop(
-    "Missing required Bioconductor packages:\n  - ",
-    paste(missing, collapse = "\n  - "),
-    "\n\nInstall once via:\n",
-    "  if (!requireNamespace('BiocManager', quietly = TRUE)) install.packages('BiocManager')\n",
-    "  BiocManager::install(c(",
-    paste(sprintf("'%s'", missing), collapse = ", "),
-    "), ask = FALSE)\n",
-    call. = FALSE
-  )
+# Function to install and load packages if missing
+install_and_load <- function(pkg, bioc=FALSE) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (bioc) {
+      if (!requireNamespace("BiocManager", quietly = TRUE)) {
+        install.packages("BiocManager")
+      }
+      BiocManager::install(pkg, ask = FALSE, update = FALSE)
+    } else {
+      install.packages(pkg)
+    }
+  }
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
 }
 
-ensure_cran <- function(pkgs) {
-  missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
-  if (length(missing) == 0) return(invisible(TRUE))
-  stop(
-    "Missing required CRAN packages:\n  - ",
-    paste(missing, collapse = "\n  - "),
-    "\n\nInstall once via:\n",
-    "  install.packages(c(",
-    paste(sprintf("'%s'", missing), collapse = ", "),
-    "))\n",
-    call. = FALSE
-  )
-}
+cran_pkgs <- c(
+  "ggplot2", "tidyverse", "purrr", "stringr", "tibble",
+  "caret", "pROC", "patchwork", "here", "parallel", "ggpubr", "circlize"
+)
+bioc_pkgs <- c(
+  "Rsamtools", "cigarillo", "GenomicRanges", "IRanges", "ChIPseeker", "biomaRt", "org.Hs.eg.db", "AnnotationDbi",
+  "Biostrings", "BSgenome.Hsapiens.UCSC.hg38", "GenomeInfoDb", "TxDb.Hsapiens.UCSC.hg38.knownGene", "GenomicFeatures",
+  "ComplexHeatmap", "methylKit"
+)
+invisible(lapply(cran_pkgs, install_and_load, bioc = FALSE))
+invisible(lapply(bioc_pkgs, install_and_load, bioc = TRUE))
 
-ensure_bioc(c("methylKit", "ComplexHeatmap", "circlize", "GenomicRanges"))
+# Config ----
+set.seed(1106)
 
-suppressPackageStartupMessages(library(methylKit))
-suppressPackageStartupMessages(library(ComplexHeatmap))
-suppressPackageStartupMessages(library(circlize))
-suppressPackageStartupMessages(library(GenomicRanges))
-
-# ------------------------------------------------------------------------------
-# Config
-# ------------------------------------------------------------------------------
-set.seed(1)
-
-CHROMS_TO_USE <- "chr21"          # Dataset is downsampled to chr21
 WIN_SIZE_BP <- 500L              # requested window size (non-overlapping tiles)
 STEP_SIZE_BP <- 500L
 
@@ -87,16 +64,7 @@ DELTA_BETA <- 0.10               # 10% methylation difference threshold (common 
 
 NCORES <- max(1L, min(8L, parallel::detectCores(logical = FALSE)))
 
-# Optional: apply the same QC thresholds used as guide-lines in 01_qc_processing.R figures.
-# (Defaults to FALSE so the script doesn't unexpectedly drop samples.)
-APPLY_QC_FILTERS <- FALSE
-QC_MIN_BISULFITE_CONV <- 0.99     # 01_qc_processing.R: dashed line at 99%
-QC_MIN_MAPPING_RATE <- 0.90       # 01_qc_processing.R: dashed line at 90%
-QC_MIN_MEAN_MAPQ <- 30            # 01_qc_processing.R: MAPQ>=30 used for downstream fragment metrics
-
-# ------------------------------------------------------------------------------
-# Paths / inputs
-# ------------------------------------------------------------------------------
+# Paths / inputs ----
 PROJECT_DIR <- here::here()
 DATA_DIR <- file.path(PROJECT_DIR, "cfDNA_WGBS_ALS_GSE164600/data")
 RAW_DIR <- file.path(DATA_DIR, "raw")
@@ -109,43 +77,12 @@ RESULTS_DIR <- file.path(PROJECT_DIR, "cfDNA_WGBS_ALS_GSE164600/results")
 FIG_DIR <- file.path(RESULTS_DIR, "figures")
 TABLE_DIR <- file.path(RESULTS_DIR, "tables")
 
-dir.create(METH_DIR, showWarnings = FALSE, recursive = TRUE)
-dir.create(CALLS_DIR, showWarnings = FALSE, recursive = TRUE)
-dir.create(RDS_DIR, showWarnings = FALSE, recursive = TRUE)
-dir.create(RESULTS_DIR, showWarnings = FALSE, recursive = TRUE)
-dir.create(FIG_DIR, showWarnings = FALSE, recursive = TRUE)
-dir.create(TABLE_DIR, showWarnings = FALSE, recursive = TRUE)
+if (!dir.exists(METH_DIR)) dir.create(METH_DIR, showWarnings = FALSE, recursive = TRUE)
+if (!dir.exists(CALLS_DIR)) dir.create(CALLS_DIR, showWarnings = FALSE, recursive = TRUE)
+if (!dir.exists(RDS_DIR)) dir.create(RDS_DIR, showWarnings = FALSE, recursive = TRUE)
 
 metadata <- readr::read_csv(file.path(DATA_DIR, "sample_metadata.csv"), show_col_types = FALSE) %>%
   mutate(Group = factor(.data$Group, levels = c("Ctrl", "ALS")))
-
-bam_qc_path <- file.path(TABLE_DIR, "qc_summary_stats.csv")
-if (file.exists(bam_qc_path)) {
-  qc_tbl <- readr::read_csv(bam_qc_path, show_col_types = FALSE) %>%
-    select(sample_id, mapping_rate, mean_mapq, bisulfite_conversion, cpg_methylation)
-
-  metadata <- metadata %>% left_join(qc_tbl, by = "sample_id")
-
-  if (isTRUE(APPLY_QC_FILTERS)) {
-    keep <- metadata %>%
-      transmute(
-        sample_id,
-        keep = is.finite(bisulfite_conversion) & bisulfite_conversion >= QC_MIN_BISULFITE_CONV &
-          is.finite(mapping_rate) & mapping_rate >= QC_MIN_MAPPING_RATE &
-          is.finite(mean_mapq) & mean_mapq >= QC_MIN_MEAN_MAPQ
-      )
-    dropped <- keep %>% filter(!keep) %>% pull(sample_id)
-    if (length(dropped) > 0) {
-      message(
-        "QC filtering enabled; dropping ", length(dropped), " sample(s): ",
-        paste(dropped, collapse = ", ")
-      )
-    }
-    metadata <- metadata %>% semi_join(keep %>% filter(keep), by = "sample_id")
-  }
-} else {
-  message("QC table not found at `results/tables/qc_summary_stats.csv`; continuing without QC-based filtering.")
-}
 
 bam_paths <- file.path(RAW_DIR, metadata$Bam_file)
 names(bam_paths) <- metadata$sample_id
@@ -202,12 +139,6 @@ theme_pub <- function(base_size = 14, base_family = "Helvetica") {
 }
 
 COLORS <- c("ALS" = "#E64B35", "Ctrl" = "#4DBBD5")
-
-save_pdf_png <- function(p, stem, w, h, dpi_png = 450) {
-  ggsave(file.path(FIG_DIR, paste0(stem, ".pdf")), p, width = w, height = h, dpi = 300, device = cairo_pdf)
-  ggsave(file.path(FIG_DIR, paste0(stem, ".png")), p, width = w, height = h, dpi = dpi_png)
-  invisible(TRUE)
-}
 
 # ------------------------------------------------------------------------------
 # 1) Extract CpG methylation calls from Bismark BAMs (methylKit)
