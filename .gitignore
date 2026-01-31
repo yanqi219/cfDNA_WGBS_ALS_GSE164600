@@ -30,3 +30,6 @@ data/raw/*.bai
 # Large outputs (optional - uncomment if needed)
 # data/processed/*.rds
 # results/figures/*.pdf
+
+/.quarto/
+**/*.quarto_ipynb

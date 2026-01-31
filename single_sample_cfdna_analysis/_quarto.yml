@@ -1,0 +1,34 @@
+project:
+  type: default
+  output-dir: .
+
+format:
+  html:
+    theme:
+      light: flatly
+      dark: darkly
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-tools: true
+    code-line-numbers: true
+    code-copy: true
+    fig-width: 10
+    fig-height: 7
+    fig-dpi: 300
+    fig-format: png
+    highlight-style: github
+    embed-resources: true
+
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: true
+
+knitr:
+  opts_chunk:
+    fig.path: "figures/"
+    fig.align: "center"
+    out.width: "100%"

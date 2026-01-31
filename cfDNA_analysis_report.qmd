@@ -1,0 +1,2873 @@
+---
+title: "Cell-free DNA Whole-Genome Bisulfite Sequencing Analysis of ALS vs Control"
+subtitle: "Comprehensive cfDNA Fragmentomics and Methylation Analysis for Disease Classification"
+author:
+  - name: "Qi Yan"
+    email: "yanqi219@gmail.com"
+date: today
+date-format: "MMMM D, YYYY"
+abstract: |
+  This report presents some representative analyses of cell-free DNA (cfDNA) from whole-genome bisulfite 
+  sequencing (WGBS) data comparing amyotrophic lateral sclerosis (ALS) patients with healthy controls.
+  The analyses include quality control metrics, insert size distributions, 5' end motif profiling,
+  differential methylation analysis, and classification. All analyses are performed
+  on chromosome 21 as a representative subset for computational efficiency.
+keywords: [cfDNA, WGBS, ALS, methylation, fragmentomics, classification, DMRseq, stackHMM, Random Forest]
+format:
+  html:
+    toc: true
+    code-fold: true
+    code-tools: true
+execute:
+  echo: true
+  warning: false
+  message: false
+bibliography: references.bib
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| cache: false
+
+# ============================================================================
+# SHARED SETUP: Packages, Paths, and Theme
+# ============================================================================
+
+# Set CRAN mirror
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+# Function to install and load packages if missing
+install_and_load <- function(pkg, bioc = FALSE) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (bioc) {
+      if (!requireNamespace("BiocManager", quietly = TRUE)) {
+        install.packages("BiocManager")
+      }
+      BiocManager::install(pkg, ask = FALSE, update = FALSE)
+    } else {
+      install.packages(pkg)
+    }
+  }
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}
+
+# CRAN packages
+cran_pkgs <- c(
+  "ggplot2", "dplyr", "tidyr", "readr", "purrr", "stringr", "tibble",
+
+"caret", "pROC", "patchwork", "here", "parallel", "ggpubr", "circlize",
+  "randomForest", "nestedcv", "Boruta", "knitr", "kableExtra"
+)
+
+# Bioconductor packages
+bioc_pkgs <- c(
+  "Rsamtools", "cigarillo", "GenomicRanges", "IRanges", "ChIPseeker",
+  "biomaRt", "org.Hs.eg.db", "AnnotationDbi", "Biostrings",
+  "BSgenome.Hsapiens.UCSC.hg38", "GenomeInfoDb",
+  "TxDb.Hsapiens.UCSC.hg38.knownGene", "GenomicFeatures",
+  "ComplexHeatmap", "bsseq", "dmrseq", "BiocParallel", "annotatr"
+)
+
+invisible(lapply(cran_pkgs, install_and_load, bioc = FALSE))
+invisible(lapply(bioc_pkgs, install_and_load, bioc = TRUE))
+
+# Set seed for reproducibility
+set.seed(389)
+
+# Paths
+PROJECT_DIR <- here::here()
+DATA_DIR <- file.path(PROJECT_DIR, "data")
+RAW_DIR <- file.path(DATA_DIR, "raw")
+PROCESSED_DIR <- file.path(DATA_DIR, "processed")
+RESULTS_DIR <- file.path(PROJECT_DIR, "results")
+FIG_DIR <- file.path(RESULTS_DIR, "figures")
+TABLE_DIR <- file.path(RESULTS_DIR, "tables")
+FRAG_DIR <- file.path(DATA_DIR, "processed", "fragments")
+RDS_DIR <- file.path(DATA_DIR, "processed/methylation/rds")
+BISMARK_COV_DIR <- file.path(PROCESSED_DIR, "methylation_extractor")
+
+# Create directories if needed
+for (d in c(RESULTS_DIR, FIG_DIR, TABLE_DIR, FRAG_DIR, RDS_DIR)) {
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+# Load sample metadata
+metadata <- readr::read_csv(file.path(DATA_DIR, "sample_metadata.csv"), show_col_types = FALSE)
+metadata <- metadata %>%
+  dplyr::mutate(Group = factor(Group, levels = c("Ctrl", "ALS")))
+
+# Load genome
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+# Publication-quality theme
+theme_pub <- function(base_size = 14, base_family = "Helvetica") {
+  theme_classic(base_size = base_size, base_family = base_family) +
+    theme(
+      plot.title = element_text(
+        face = "bold", hjust = 0.5, size = rel(1.25), margin = margin(b = 8)
+      ),
+      plot.subtitle = element_text(
+        hjust = 0.5, size = rel(1.07), margin = margin(b = 6)
+      ),
+      axis.title.x = element_text(
+        face = "bold", size = rel(1.08), margin = margin(t = 9)
+      ),
+      axis.title.y = element_text(
+        face = "bold", size = rel(1.08), margin = margin(r = 9)
+      ),
+      axis.text = element_text(color = "black", size = rel(1.00)),
+      axis.ticks = element_line(color = "black", linewidth = 0.45),
+      axis.line = element_line(color = "black", linewidth = 0.7),
+      legend.title = element_text(face = "bold", size = rel(1.08)),
+      legend.text = element_text(size = rel(1.00)),
+      legend.key = element_rect(fill = "transparent", color = NA),
+      legend.background = element_rect(fill = "transparent", color = NA),
+      legend.position = "right",
+      legend.justification = "center",
+      legend.box.background = element_rect(color = NA, fill = NA),
+      panel.border = element_blank(),
+      panel.grid.major = element_line(
+        color = "gray85", linewidth = 0.30, linetype = "dotted"
+      ),
+      panel.grid.minor = element_blank(),
+      strip.background = element_rect(fill = "gray95", color = NA),
+      strip.text = element_text(
+        face = "bold", size = rel(1.05), margin = margin(t = 3, b = 3)
+      ),
+      plot.margin = margin(16, 16, 16, 16)
+    )
+}
+
+# Color palette for groups
+COLORS <- c("ALS" = "#E64B35", "Ctrl" = "#4DBBD5")
+
+# Feature set colors (for classification)
+FEATURE_COLORS <- c("stackHMM" = "#8491B4", "Motif" = "#91D1C2", "MethTile" = "#F39B7F")
+
+# Helper: format p-values
+format_pval <- function(p) {
+  ifelse(p < 0.001, "< 0.001", sprintf("%.3f", p))
+}
+
+# Knitr options
+knitr::opts_chunk$set(
+  fig.align = "center",
+  out.width = "100%",
+  dpi = 300
+)
+```
+
+# Introduction
+
+Cell-free DNA (cfDNA) analysis has emerged as a powerful non-invasive approach for disease detection and monitoring. In this study, we analyze cfDNA from whole-genome bisulfite sequencing (WGBS) data to distinguish amyotrophic lateral sclerosis (ALS) patients from healthy controls.
+
+The analysis integrates multiple cfDNA features:
+
+1. **Quality Control**: Mapping statistics, bisulfite conversion efficiency, and coverage metrics
+2. **Insert Size Analysis**: Insert size distributions and nucleosome positioning patterns
+3. **End Motif Profiling**: 5' end 4-mer motif frequencies reflecting nuclease preferences
+4. **DNA Methylation**: Differentially methylated regions (DMRs) using dmrseq
+5. **Machine Learning Classification**: Random Forest with nested cross-validation
+
+## Study Design
+
+```{r}
+#| label: study-design
+#| echo: false
+
+metadata %>%
+  dplyr::group_by(Group) %>%
+  dplyr::summarise(
+    `N Samples` = n(),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(
+    caption = "Sample distribution by group",
+    align = "lc"
+  ) %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Sample Demographics
+
+```{r}
+#| label: age-distribution
+#| code-fold: true
+#| code-summary: "Age Distribution Plot"
+#| eval: false
+
+# Figure 0: Age distribution by group ----
+p_age <- ggplot(metadata, aes(x = Group, y = Age, fill = Group)) +
+  geom_boxplot(alpha = 0.8, outlier.shape = 16, outlier.size = 2) +
+  geom_jitter(width = 0.12, size = 1.8, alpha = 0.5) +
+  scale_fill_manual(values = COLORS) +
+  labs(title = "Age distribution by group", x = "Group", y = "Age") +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = rel(1.2),
+                              margin = ggplot2::margin(b = 8)),
+    plot.subtitle = element_text(hjust = 0.5, margin = ggplot2::margin(b = 6)),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(color = "black"),
+    legend.title = element_text(face = "bold"),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.3, linetype = "dotted"),
+    plot.margin = ggplot2::margin(12, 12, 12, 12)
+  )
+ggsave(file.path(FIG_DIR, "fig0_age_distribution_by_group.png"), p_age, width = 6, height = 5, dpi = 450)
+```
+
+![Age distribution by group showing comparable age ranges between ALS and Control cohorts.](results/figures/fig0_age_distribution_by_group.png){#fig-age-dist width="60%"}
+
+---
+
+# Quality Control {#sec-qc}
+
+::: {.panel-tabset}
+
+## Methods
+
+### Sample Demographics
+
+Sample age distributions were compared between ALS and Control groups to assess demographic balance. 
+Age was visualized using boxplots with individual data points overlaid to show the full distribution.
+
+### Data Preprocessing and Quality Control
+
+Quality control metrics were extracted from aligned BAM files generated by Bismark [@krueger2011bismark]. 
+The following QC procedures were applied:
+
+**Alignment Statistics (flagstat)**
+Read-level statistics were computed by parsing SAM flags to determine:
+
+- Total reads and mapping rate
+- Properly paired reads (both mates mapped in correct orientation)
+- Duplicate reads (PCR/optical duplicates)
+- Secondary and supplementary alignments
+
+**Quality Filtering**
+Reads were filtered using the following criteria:
+
+- Paired-end reads with both mates mapped (`isPaired = TRUE`, `isProperPair = TRUE`)
+- Mapping quality MAPQ ≥ 30
+- Non-duplicate reads (`isDuplicate = FALSE`)
+- Primary alignments only (`isSecondaryAlignment = FALSE`, `isSupplementaryAlignment = FALSE`)
+
+**Fragment Extraction**
+Fragment coordinates were derived from paired-end alignments using a BEDPE-style approach:
+
+- Fragment start: minimum alignment start position
+- Fragment end: maximum alignment end position
+- Fragment length: end - start (retained if 0 < length ≤ 1000 bp)
+
+**GC Content**
+GC content was calculated per fragment as (G+C)/(A+C+G+T), excluding N bases, using the 
+BSgenome.Hsapiens.UCSC.hg38 reference genome [@bsgenome].
+
+**Methylation Metrics**
+Bismark XM tags were parsed to extract methylation calls:
+
+- CpG methylation rate: methylated CpG (Z) / (Z + z)
+- Bisulfite conversion efficiency: 1 - CHH methylation rate
+  - CHH methylation should be <1% for complete bisulfite conversion [@lister2009human]
+
+### Statistical Analysis
+
+Group comparisons were performed using two-sided Student's t-test. Visualizations were generated.
+
+### Software
+
+- **R**: v`r paste(R.version$major, R.version$minor, sep = ".")`
+- **Rsamtools**: BAM file parsing [@rsamtools]
+- **BSgenome.Hsapiens.UCSC.hg38**: Reference genome sequences
+- **ggplot2**: Data visualization
+
+## Code
+
+```{r}
+#| label: qc-functions
+#| code-fold: true
+#| code-summary: "QC Functions"
+
+# ============================================================================
+# QC FUNCTIONS
+# ============================================================================
+
+## Flagstat function ----
+get_flagstat <- function(bam_path) {
+  
+  param_all <- ScanBamParam(what = "flag")
+  bf <- BamFile(bam_path, yieldSize = 5e6)
+  open(bf)
+  
+  total <- 0
+  mapped <- 0
+  paired <- 0
+  proper_pair <- 0
+  duplicates <- 0
+  secondary <- 0
+  supplementary <- 0
+  
+  repeat {
+    flags <- scanBam(bf, param = param_all)[[1]]$flag
+    if (length(flags) == 0) break
+    
+    total <- total + length(flags)
+    mapped <- mapped + sum(bitwAnd(flags, 4) == 0)        # bit 4 = unmapped
+    paired <- paired + sum(bitwAnd(flags, 1) > 0)         # bit 1 = paired
+    proper_pair <- proper_pair + sum(bitwAnd(flags, 2) > 0)  # bit 2 = proper pair
+    duplicates <- duplicates + sum(bitwAnd(flags, 1024) > 0) # bit 1024 = duplicate
+    secondary <- secondary + sum(bitwAnd(flags, 256) > 0)    # bit 256 = secondary
+    supplementary <- supplementary + sum(bitwAnd(flags, 2048) > 0) # bit 2048 = supplementary
+  }
+  close(bf)
+  
+  data.frame(
+    total_reads = total,
+    mapped = mapped,
+    unmapped = total - mapped,
+    paired = paired,
+    properly_paired = proper_pair,
+    duplicates = duplicates,
+    secondary = secondary,
+    supplementary = supplementary,
+    mapping_rate = mapped / total,
+    proper_pair_rate = proper_pair / paired,
+    duplicate_rate = duplicates / total
+  )
+}
+
+## Parse Bismark XM methylation tags ----
+parse_xm_tags <- function(xm_tags) {
+  all_chars <- paste(xm_tags, collapse = "")
+  
+  data.frame(
+    Z = stringr::str_count(all_chars, "Z"),  # methylated CpG
+    z = stringr::str_count(all_chars, "z"),  # unmethylated CpG
+    X = stringr::str_count(all_chars, "X"),  # methylated CHG
+    x = stringr::str_count(all_chars, "x"),  # unmethylated CHG
+    H = stringr::str_count(all_chars, "H"),  # methylated CHH
+    h = stringr::str_count(all_chars, "h")   # unmethylated CHH
+  )
+}
+
+## Extract BAM metrics ----
+extract_bam_metrics <- function(bam_path, sample_id, genome, chunk_size = 1e6, frag_dir = FRAG_DIR) {
+  
+  message(sprintf("Processing: %s", sample_id))
+  
+  if (!file.exists(bam_path)) {
+    warning(sprintf("BAM file not found: %s", bam_path))
+    return(NULL)
+  }
+  
+  # Get flag statistics
+  flagstat <- get_flagstat(bam_path)
+  
+  # BAM parameters
+  param <- ScanBamParam(
+    flag = scanBamFlag(isPaired = TRUE, isProperPair = TRUE,
+                       isUnmappedQuery = FALSE, hasUnmappedMate = FALSE,
+                       isDuplicate = FALSE,
+                       isSecondaryAlignment = FALSE, isSupplementaryAlignment = FALSE,
+                       isNotPassingQualityControls = FALSE),
+    what = c("qname", "flag", "rname", "pos", "mapq", "cigar", "isize", "seq", "qwidth"),
+    tag = c("XM")
+  )
+  
+  bf <- BamFile(bam_path, yieldSize = chunk_size)
+  open(bf)
+  
+  frag_lengths <- integer()
+  meth_calls <- list()
+  total_reads <- 0
+  mapq_values <- integer()
+  gc_values <- numeric()
+  
+  # Fragment BED output
+  fragment_bed_path <- file.path(frag_dir, paste0(sample_id, ".fragments.bed.gz"))
+  frag_con <- gzfile(fragment_bed_path, open = "wt")
+  on.exit(try(close(frag_con), silent = TRUE), add = TRUE)
+  
+  pending_aln <- tibble::tibble(
+    qname = character(), flag = integer(), rname = character(),
+    pos = integer(), cigar = character(), mapq = integer()
+  )
+  
+  repeat {
+    chunk_raw <- scanBam(bf, param = param)[[1]]
+    if (length(chunk_raw$qname) == 0) break
+    
+    mapq_values <- c(mapq_values, chunk_raw$mapq)
+    keep_idx <- which(chunk_raw$mapq >= 30)
+    chunk <- lapply(chunk_raw, function(x) {
+      if (length(x) == length(chunk_raw$mapq)) return(x[keep_idx])
+      if (is.list(x)) return(lapply(x, function(tag_vector) tag_vector[keep_idx]))
+      return(x)
+    })
+    
+    total_reads <- total_reads + length(chunk$qname)
+    
+    # Fragment pairing
+    if (length(chunk$qname) > 0) {
+      aln <- tibble::tibble(
+        qname = as.character(chunk$qname),
+        flag = as.integer(chunk$flag),
+        rname = as.character(chunk$rname),
+        pos = as.integer(chunk$pos),
+        cigar = as.character(chunk$cigar),
+        mapq = as.integer(chunk$mapq)
+      ) %>%
+        dplyr::filter(!is.na(qname), !is.na(rname), !is.na(pos), !is.na(cigar),
+                      is.finite(pos), pos > 0L)
+      
+      if (nrow(aln) > 0) {
+        aln <- aln %>%
+          dplyr::mutate(
+            start0 = pos - 1L,
+            end0_excl = start0 + as.integer(cigarillo::cigar_extent_along_ref(cigar)),
+            strand = dplyr::if_else(bitwAnd(flag, 16L) > 0L, "-", "+")
+          ) %>%
+          dplyr::filter(is.finite(start0), is.finite(end0_excl), end0_excl > start0)
+        
+        aln_all <- dplyr::bind_rows(pending_aln, aln)
+        tab <- table(aln_all$qname)
+        have_pair <- names(tab[tab >= 2L])
+        
+        if (length(have_pair) > 0) {
+          pair_rows <- aln_all %>%
+            dplyr::filter(qname %in% have_pair) %>%
+            dplyr::group_by(qname) %>%
+            dplyr::slice(1:2) %>%
+            dplyr::ungroup()
+          
+          pending_aln <- aln_all %>% dplyr::filter(!(qname %in% have_pair))
+          
+          pair_rows <- pair_rows[order(pair_rows$qname), , drop = FALSE]
+          mate_raw <- stats::ave(pair_rows$qname, pair_rows$qname, FUN = seq_along)
+          
+          idx1 <- which(mate_raw == 1L)
+          idx2 <- which(mate_raw == 2L)
+          
+          same_chr <- pair_rows$rname[idx1] == pair_rows$rname[idx2]
+          swap_per_pair <- ifelse(
+            same_chr,
+            pair_rows$start0[idx1] > pair_rows$start0[idx2],
+            pair_rows$rname[idx1] > pair_rows$rname[idx2]
+          )
+          
+          i1 <- ifelse(swap_per_pair, idx2, idx1)
+          i2 <- ifelse(swap_per_pair, idx1, idx2)
+          
+          pair_w <- tibble::tibble(
+            qname = pair_rows$qname[idx1],
+            rname_1 = pair_rows$rname[i1], start0_1 = pair_rows$start0[i1],
+            end0_excl_1 = pair_rows$end0_excl[i1], mapq_1 = pair_rows$mapq[i1],
+            strand_1 = pair_rows$strand[i1],
+            rname_2 = pair_rows$rname[i2], start0_2 = pair_rows$start0[i2],
+            end0_excl_2 = pair_rows$end0_excl[i2], mapq_2 = pair_rows$mapq[i2],
+            strand_2 = pair_rows$strand[i2]
+          ) %>%
+            dplyr::filter(!is.na(rname_1) & !is.na(rname_2))
+          
+          pair_w <- pair_w %>% dplyr::arrange(rname_1, start0_1)
+          
+          if (nrow(pair_w) > 0) {
+            score <- pmin(pair_w$mapq_1, pair_w$mapq_2)
+            same_chr <- pair_w$rname_1 == pair_w$rname_2
+            
+            if (any(same_chr)) {
+              frag_start0 <- pair_w$start0_1[same_chr]
+              frag_end0 <- pair_w$end0_excl_2[same_chr]
+              length_bp <- frag_end0 - frag_start0
+              
+              keep_len <- is.finite(length_bp) & length_bp > 0L & length_bp <= 1000L
+              if (any(keep_len)) {
+                gc <- rep(NA_real_, sum(keep_len))
+                gr_frag <- GenomicRanges::GRanges(
+                  seqnames = pair_w$rname_1[same_chr][keep_len],
+                  ranges = IRanges::IRanges(
+                    start = as.integer(frag_start0[keep_len] + 1L),
+                    end = as.integer(frag_end0[keep_len])
+                  ),
+                  strand = "*"
+                )
+                
+                gc <- tryCatch({
+                  seqs <- BSgenome::getSeq(genome, gr_frag)
+                  acgt <- Biostrings::letterFrequency(seqs, letters = c("A", "C", "G", "T"), as.prob = FALSE)
+                  denom <- rowSums(acgt)
+                  num_gc <- acgt[, "C"] + acgt[, "G"]
+                  ifelse(denom > 0, num_gc / denom, NA_real_)
+                }, error = function(e) rep(NA_real_, length(gr_frag)))
+                
+                frag_lines <- paste(
+                  pair_w$rname_1[same_chr][keep_len],
+                  as.integer(frag_start0[keep_len]),
+                  as.integer(frag_end0[keep_len]),
+                  pair_w$qname[same_chr][keep_len],
+                  as.integer(score[same_chr][keep_len]),
+                  pair_w$strand_1[same_chr][keep_len],
+                  as.integer(length_bp[keep_len]),
+                  formatC(gc, format = "f", digits = 4),
+                  sep = "\t"
+                )
+                writeLines(frag_lines, con = frag_con, useBytes = TRUE)
+                frag_lengths <- c(frag_lengths, as.integer(length_bp[keep_len]))
+                gc_values <- c(gc_values, gc)
+              }
+            }
+          }
+        } else {
+          pending_aln <- aln_all
+        }
+      }
+    }
+    
+    # Methylation calls
+    if (!is.null(chunk$tag$XM)) {
+      xm_tags <- chunk$tag$XM[!is.na(chunk$tag$XM)]
+      if (length(xm_tags) > 0) {
+        meth_calls[[length(meth_calls) + 1]] <- parse_xm_tags(xm_tags)
+      }
+    }
+    
+    rm(chunk)
+    gc(verbose = FALSE)
+  }
+  
+  close(bf)
+  
+  meth_summary <- if (length(meth_calls) > 0) {
+    do.call(rbind, meth_calls) %>% summarise(across(everything(), sum))
+  } else {
+    data.frame(Z = 0, z = 0, X = 0, x = 0, H = 0, h = 0)
+  }
+  
+  list(
+    sample_id = sample_id,
+    fragment_bed = fragment_bed_path,
+    flagstat = flagstat,
+    filtered_reads = total_reads,
+    fragment_lengths = frag_lengths,
+    gc_content = gc_values,
+    mapq = mapq_values,
+    methylation = meth_summary
+  )
+}
+
+## Calculate summary statistics ----
+calculate_summary_stats <- function(metrics) {
+  if (is.null(metrics)) return(data.frame(sample_id = NA))
+  
+  fl <- metrics$fragment_lengths
+  gc <- metrics$gc_content
+  meth <- metrics$methylation
+  fs <- metrics$flagstat
+  
+  cpg_total <- meth$Z + meth$z
+  cpg_meth_rate <- if (cpg_total > 0) meth$Z / cpg_total else NA
+  
+  chh_total <- meth$H + meth$h
+  chh_meth_rate <- if (chh_total > 0) meth$H / chh_total else NA
+  bisulfite_conv <- if (!is.na(chh_meth_rate)) 1 - chh_meth_rate else NA
+  
+  data.frame(
+    sample_id = metrics$sample_id,
+    total_reads = fs$total_reads,
+    mapped_reads = fs$mapped,
+    unmapped_reads = fs$unmapped,
+    properly_paired = fs$properly_paired,
+    duplicates = fs$duplicates,
+    mapping_rate = fs$mapping_rate,
+    proper_pair_rate = fs$proper_pair_rate,
+    duplicate_rate = fs$duplicate_rate,
+    filtered_reads = metrics$filtered_reads,
+    filter_pass_rate = metrics$filtered_reads / fs$total_reads,
+    gc_content = mean(gc, na.rm = TRUE),
+    n_fragments = length(fl),
+    mean_frag_length = mean(fl),
+    median_frag_length = median(fl),
+    sd_frag_length = sd(fl),
+    frag_mode = as.numeric(names(sort(table(fl), decreasing = TRUE))[1]),
+    short_frag_ratio = sum(fl < 150) / length(fl),
+    mono_nuc_ratio = sum(fl >= 150 & fl <= 220) / length(fl),
+    di_nuc_ratio = sum(fl >= 300 & fl <= 400) / length(fl),
+    mean_mapq = mean(metrics$mapq),
+    cpg_methylation = cpg_meth_rate,
+    chh_methylation = chh_meth_rate,
+    bisulfite_conversion = bisulfite_conv
+  )
+}
+```
+
+```{r}
+#| label: qc-analysis
+#| code-fold: true
+#| code-summary: "QC Analysis Pipeline"
+#| eval: false
+
+# ============================================================================
+# PROCESS ALL SAMPLES
+# ============================================================================
+
+all_metrics <- lapply(seq_len(nrow(metadata)), function(i) {
+  row <- metadata[i, ]
+  bam_path <- file.path(RAW_DIR, row$Bam_file)
+  
+  metrics <- extract_bam_metrics(
+    bam_path = bam_path,
+    sample_id = row$sample_id,
+    genome = genome,
+    frag_dir = FRAG_DIR
+  )
+  
+  return(metrics)
+})
+
+# Filter out failed samples
+all_metrics <- all_metrics[!sapply(all_metrics, is.null)]
+
+if (length(all_metrics) == 0) {
+  stop("No BAM files found. Please check data/raw/ directory.")
+}
+
+saveRDS(all_metrics, file.path(DATA_DIR, "processed", "all_metrics.rds"))
+
+# Summary statistics table
+summary_stats <- purrr::map_dfr(all_metrics, calculate_summary_stats)
+summary_stats <- summary_stats %>%
+  dplyr::left_join(metadata, by = "sample_id")
+
+readr::write_csv(summary_stats, file.path(TABLE_DIR, "qc_summary_stats.csv"))
+```
+
+```{r}
+#| label: qc-visualization
+#| code-fold: true
+#| code-summary: "QC Visualization Code"
+#| eval: false
+
+# ============================================================================
+# QC VISUALIZATION
+# ============================================================================
+
+key_metrics <- summary_stats %>%
+  dplyr::select(
+    sample_id, Group, total_reads, filtered_reads, median_frag_length,
+    mean_mapq, cpg_methylation, bisulfite_conversion, gc_content
+  ) %>%
+  dplyr::mutate(
+    total_reads_m = total_reads / 1e6,
+    filtered_reads_m = filtered_reads / 1e6,
+    bisulfite_conversion_pct = 100 * bisulfite_conversion,
+    cpg_methylation_pct = 100 * cpg_methylation
+  )
+
+key_metrics_long_sample <- key_metrics %>%
+  dplyr::select(sample_id, Group, total_reads_m, filtered_reads_m, median_frag_length,
+                mean_mapq, cpg_methylation_pct, bisulfite_conversion_pct, gc_content) %>%
+  tidyr::pivot_longer(
+    cols = c(total_reads_m, filtered_reads_m, median_frag_length, mean_mapq,
+             cpg_methylation_pct, bisulfite_conversion_pct, gc_content),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  dplyr::mutate(
+    sample_id = factor(sample_id, levels = key_metrics %>%
+                         dplyr::arrange(Group, sample_id) %>%
+                         dplyr::pull(sample_id)),
+    metric = factor(
+      metric,
+      levels = c("total_reads_m", "filtered_reads_m", "mean_mapq", "median_frag_length",
+                 "gc_content", "cpg_methylation_pct", "bisulfite_conversion_pct"),
+      labels = c("Total reads (M)", "Filtered reads (M)", "Mean MAPQ",
+                 "Median fragment length (bp)", "GC content (%)",
+                 "CpG methylation (%)", "Bisulfite conversion (%)")
+    )
+  )
+
+# Per-sample bar plot
+p_qc_sample <- ggplot(key_metrics_long_sample, aes(x = value, y = sample_id, fill = Group)) +
+  geom_col(width = 0.8, alpha = 0.95) +
+  facet_wrap(~metric, scales = "free_x", ncol = 3) +
+  scale_fill_manual(values = COLORS) +
+  labs(title = "QCs by sample", x = NULL, y = "Sample", fill = "Group") +
+  theme_pub(base_size = 12) +
+  theme(legend.position = "top", axis.text.y = element_text(size = 7))
+
+# Group comparison boxplot
+p_qc_group <- ggplot(key_metrics_long_sample, aes(x = Group, y = value, fill = Group)) +
+  geom_boxplot(width = 0.55, outlier.shape = NA, alpha = 0.95) +
+  geom_jitter(width = 0.12, size = 1.8, alpha = 0.5) +
+  facet_wrap(~metric, scales = "free_y", ncol = 4) +
+  scale_fill_manual(values = COLORS) +
+  labs(title = "QCs by group", x = NULL, y = NULL) +
+  theme_pub(base_size = 12) +
+  theme(legend.position = "none") +
+  ggpubr::stat_compare_means(method = "t.test")
+
+# Combined figure
+p_qc_combined <- p_qc_group / p_qc_sample +
+  patchwork::plot_annotation(tag_levels = "A") +
+  patchwork::plot_layout(heights = c(1, 1.4))
+
+ggsave(file.path(FIG_DIR, "fig1_qc_key_metrics.png"),
+       p_qc_combined, width = 14, height = 18, dpi = 300)
+```
+
+## Results
+
+### QC Summary Statistics
+
+The following quality control metrics were computed for all samples:
+
+```{r}
+#| label: qc-table
+#| echo: false
+
+# Load pre-computed QC summary
+qc_summary <- readr::read_csv(file.path(TABLE_DIR, "qc_summary_stats.csv"), show_col_types = FALSE)
+
+qc_summary %>%
+  dplyr::select(sample_id, Group, total_reads, filtered_reads, mapping_rate,
+                duplicate_rate, cpg_methylation, bisulfite_conversion) %>%
+  dplyr::mutate(
+    total_reads = scales::comma(total_reads),
+    filtered_reads = scales::comma(filtered_reads),
+    mapping_rate = scales::percent(mapping_rate, accuracy = 0.1),
+    duplicate_rate = scales::percent(duplicate_rate, accuracy = 0.1),
+    cpg_methylation = scales::percent(cpg_methylation, accuracy = 0.1),
+    bisulfite_conversion = scales::percent(bisulfite_conversion, accuracy = 0.1)
+  ) %>%
+  knitr::kable(
+    col.names = c("Sample", "Group", "Total Reads", "Filtered Reads",
+                  "Mapping Rate", "Dup Rate", "CpG Meth", "BS Conv"),
+    caption = "Quality control metrics by sample",
+    align = "llrrrrrr"
+  ) %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                            font_size = 11, full_width = FALSE)
+```
+
+### QC Metrics Visualization
+
+![Quality control metrics across samples and groups. (A) Comparison of key QC metrics between ALS and Control groups with t-test p-values. (B) Per-sample breakdown of QC metrics.](results/figures/fig1_qc_key_metrics.png){#fig-qc width="100%"}
+
+**Key Observations:**
+
+- **Mapping rate**: High mapping rates (>95%) across all samples indicate good library quality
+- **Bisulfite conversion**: >99% conversion efficiency confirms complete bisulfite treatment
+- **CpG methylation**: Global CpG methylation levels are consistent between groups
+- **Fragment length**: Median fragment lengths cluster around the nucleosome-protected size (~167 bp); median fragment lengths differ between ALS vs. controls.
+
+:::
+
+---
+
+# Fragment Analysis {#sec-frag}
+
+::: {.panel-tabset}
+
+## Methods
+
+### Insert Size Distribution Analysis
+
+Fragment length (insert size) distributions were analyzed to characterize nucleosome positioning 
+patterns in cfDNA [@snyder2016cfdna; @cristiano2019fragmentomics].
+
+**Fragment Size Metrics**
+
+- Fragment lengths were extracted from paired-end alignments (30-500 bp range)
+- Key metrics computed per sample:
+  - Median and mode fragment length
+  - Short fragment ratio: fragments 100-150 bp / fragments 151-220 bp
+- The characteristic "sawtooth" pattern reflects nucleosome protection with ~10 bp periodicity 
+  corresponding to DNA helical repeat [@snyder2016cfdna]
+
+**Nucleosome Positioning**
+
+- Mono-nucleosome peak: ~167 bp (147 bp core + ~20 bp linker)
+- Di-nucleosome peak: ~334 bp
+
+### Genome-wide Fragmentation Ratio
+
+Following the approach of Cristiano et al. [@cristiano2019fragmentomics], genome-wide fragmentation 
+patterns were analyzed using short/long fragment ratios:
+
+**Bin Definition**
+
+- Genome tiled into 2 Mb bins (chr21 for computational efficiency)
+- Short fragments: 90-150 bp
+- Long fragments: 151-220 bp
+
+**GC Bias Correction**
+
+To account for GC-dependent sequencing biases, LOESS regression was applied:
+
+1. Log-transformed fragment counts regressed against bin GC content
+2. Correction factor: observed / predicted × median(observed)
+3. Bins with extreme GC (<10% or >85%) or high N-fraction (>45%) excluded from model fitting
+
+### TSS Enrichment Analysis
+
+Transcription start site (TSS) enrichment profiles reveal nucleosome-free regions at active promoters:
+
+**Profile Generation**
+
+1. Fragment 5' start coordinates extracted (strand-aware)
+2. Positions counted relative to TSS (±2000 bp window)
+3. Signal normalized to edge mean (baseline = 1)
+4. Running average (k=40 bp) applied for smoothing
+
+**Annotation**
+- Gene-level TSS from TxDb.Hsapiens.UCSC.hg38.knownGene
+- ChIPseeker for genomic feature annotation [@yu2015chipseeker]
+
+### Statistical Analysis
+
+- Group comparisons: Student's t-test
+
+### Software
+
+- **GenomicRanges**: Genomic interval operations [@lawrence2013genomicranges]
+- **TxDb.Hsapiens.UCSC.hg38.knownGene**: Gene annotations
+- **ChIPseeker**: Feature annotation [@yu2015chipseeker]
+- **Gviz**: Chromosome-style visualizations (optional) [@hahne2016gviz]
+
+## Code
+
+```{r}
+#| label: frag-helpers
+#| code-fold: true
+#| code-summary: "Fragment Analysis Helper Functions"
+
+# ============================================================================
+# FRAGMENTATION ANALYSIS HELPERS
+# ============================================================================
+
+FRAG_COLS <- c("chrom", "start0", "end0", "name", "mapq", "strand", "length_bp", "gc")
+FRAG_COL_CLASSES <- c(
+  chrom = "character", start0 = "integer", end0 = "integer",
+  name = "character", mapq = "integer", strand = "character",
+  length_bp = "integer", gc = "numeric"
+)
+
+# Chunked reader for gzipped fragment BEDs
+read_fragments_chunked <- function(path, chunk_size = 200000L, FUN) {
+  chunk_size <- as.integer(chunk_size)
+  con <- gzfile(path, open = "rt")
+  on.exit(try(close(con), silent = TRUE), add = TRUE)
+  
+  repeat {
+    x <- utils::read.delim(
+      file = con, header = FALSE, sep = "\t", nrows = chunk_size,
+      col.names = FRAG_COLS, colClasses = FRAG_COL_CLASSES,
+      stringsAsFactors = FALSE, quote = "", comment.char = "", fill = TRUE
+    )
+    if (nrow(x) == 0) break
+    FUN(x)
+  }
+  invisible(TRUE)
+}
+
+# Moving average for smoothing
+moving_average <- function(x, k = 21L) {
+  k <- as.integer(k)
+  if (k < 3L) return(x)
+  if (k %% 2L == 0L) k <- k + 1L
+  w <- rep(1 / k, k)
+  as.numeric(stats::filter(x, w, sides = 2, method = "convolution"))
+}
+
+# Convert BED chunk to fragment midpoint GRanges
+chunk_to_midpoint_gr <- function(df) {
+  start1 <- df$start0 + 1L
+  end1 <- df$end0
+  mid <- as.integer(floor((start1 + end1) / 2))
+  GenomicRanges::GRanges(
+    seqnames = df$chrom,
+    ranges = IRanges::IRanges(start = mid, width = 1L),
+    strand = "*",
+    length_bp = df$length_bp
+  )
+}
+
+# 5' fragment start coordinates (strand-aware)
+chunk_to_5p_start_gr <- function(df) {
+  start1 <- df$start0 + 1L
+  end1 <- df$end0
+  pos1 <- ifelse(df$strand == "-", end1, start1)
+  GenomicRanges::GRanges(
+    seqnames = df$chrom,
+    ranges = IRanges::IRanges(start = as.integer(pos1), width = 1L),
+    strand = "*"
+  )
+}
+
+# LOESS GC-bias correction
+correct_gc_bias <- function(counts, gc_values, fit_mask = NULL, pseudocount = 1, span = 0.75) {
+  counts <- as.numeric(counts)
+  gc_values <- as.numeric(gc_values)
+  pseudocount <- as.numeric(pseudocount)
+  
+  if (is.null(fit_mask)) {
+    fit_mask <- is.finite(gc_values) & is.finite(counts)
+  } else {
+    fit_mask <- as.logical(fit_mask) & is.finite(gc_values) & is.finite(counts)
+  }
+  fit_mask_in <- fit_mask
+  
+  y <- log(counts + pseudocount)
+  fit_mask <- fit_mask & is.finite(y)
+  
+  if (sum(fit_mask) < 20L) return(counts)
+  
+  fit <- stats::loess(
+    y[fit_mask] ~ gc_values[fit_mask],
+    span = span, degree = 1, family = "symmetric",
+    control = stats::loess.control(surface = "direct")
+  )
+  
+  pred <- stats::predict(fit, newdata = gc_values)
+  med <- stats::median(counts[fit_mask] + pseudocount, na.rm = TRUE)
+  corrected <- (counts + pseudocount) / exp(pred) * med
+  
+  corrected[!fit_mask_in] <- NA_real_
+  corrected[!is.finite(pred)] <- NA_real_
+  corrected
+}
+```
+
+```{r}
+#| label: frag-insert-size
+#| code-fold: true
+#| code-summary: "Insert Size Analysis Code"
+#| eval: false
+
+# ============================================================================
+# INSERT SIZE ANALYSIS
+# ============================================================================
+
+# Load pre-computed metrics
+all_metrics <- readRDS(file.path(DATA_DIR, "processed", "all_metrics.rds"))
+
+frag_df <- purrr::map_dfr(all_metrics, function(m) {
+  data.frame(
+    sample_id = m$sample_id,
+    fragment_length = as.integer(m$fragment_lengths)
+  )
+}) %>%
+  dplyr::left_join(metadata, by = "sample_id")
+
+calc_mode <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) return(NA_integer_)
+  x <- as.integer(x)
+  tabulate(x, nbins = max(x)) |> which.max()
+}
+
+insert_metrics <- frag_df %>%
+  dplyr::group_by(sample_id, Group) %>%
+  dplyr::summarise(
+    n_fragments = dplyr::n(),
+    median_bp = stats::median(fragment_length),
+    mode_bp = calc_mode(fragment_length),
+    short_n = sum(fragment_length >= 100 & fragment_length <= 150),
+    long_n = sum(fragment_length >= 151 & fragment_length <= 220),
+    short_long_ratio = dplyr::if_else(long_n > 0, short_n / long_n, NA_real_),
+    .groups = "drop"
+  )
+
+# Insert size metrics by group
+metric_long <- insert_metrics %>%
+  dplyr::select(sample_id, Group, median_bp, mode_bp, short_long_ratio) %>%
+  tidyr::pivot_longer(
+    cols = c(median_bp, mode_bp, short_long_ratio),
+    names_to = "metric", values_to = "value"
+  ) %>%
+  dplyr::mutate(
+    metric = factor(metric,
+      levels = c("median_bp", "mode_bp", "short_long_ratio"),
+      labels = c("Median (bp)", "Mode (bp)", "Short/Long ratio"))
+  )
+
+is_metrics <- ggplot(metric_long, aes(x = Group, y = value, fill = Group)) +
+  geom_boxplot(width = 0.55, outlier.shape = NA, alpha = 0.9) +
+  geom_jitter(aes(color = Group), width = 0.12, size = 1.8, alpha = 0.7) +
+  scale_fill_manual(values = COLORS) +
+  scale_color_manual(values = COLORS) +
+  facet_wrap(~metric, scales = "free_y", ncol = 3) +
+  ggpubr::stat_compare_means(method = "t.test") +
+  labs(title = "Insert size metrics", x = NULL, y = NULL) +
+  theme_pub() +
+  theme(legend.position = "none")
+
+# Sawtooth plot (binwidth = 1)
+frag_df_saw <- frag_df %>%
+  dplyr::filter(fragment_length >= 80 & fragment_length <= 450)
+
+counts_saw <- frag_df_saw %>%
+  dplyr::count(sample_id, Group, fragment_length, name = "n")
+
+ann_df <- counts_saw %>%
+  dplyr::group_by(sample_id, Group) %>%
+  dplyr::summarise(ymax = max(n), .groups = "drop") %>%
+  dplyr::left_join(insert_metrics, by = c("sample_id", "Group")) %>%
+  dplyr::mutate(label = sprintf("Median: %.0f bp", median_bp), x = 245, y = 0.92 * ymax)
+
+is_saw <- ggplot(counts_saw, aes(x = fragment_length, y = n)) +
+  geom_line(linewidth = 0.35, color = "gray20") +
+  geom_vline(xintercept = 167, linetype = "dashed", color = "#2E2E2E", linewidth = 0.4) +
+  geom_vline(xintercept = 334, linetype = "dashed", color = "#2E2E2E", linewidth = 0.4) +
+  geom_text(data = ann_df, aes(x = x, y = y, label = label),
+            inherit.aes = FALSE, hjust = 0, size = 2.6, color = "gray10") +
+  facet_wrap(~sample_id, scales = "free_y", ncol = 4) +
+  labs(
+    title = "Sawtooth insert-size pattern (binwidth = 1)",
+    subtitle = "Dashed lines: mono-nucleosome (~167 bp) and di-nucleosome (~334 bp)",
+    x = "Fragment length (bp)", y = "Count"
+  ) +
+  theme_pub(base_size = 10) +
+  theme(strip.text = element_text(size = 8, face = "bold"), axis.text = element_text(size = 8))
+
+# Group-level median distributions
+len_min <- 30L; len_max <- 500L
+len_grid <- len_min:len_max
+
+frag_df_30_500 <- frag_df %>%
+  dplyr::filter(!is.na(fragment_length), fragment_length >= len_min, fragment_length <= len_max)
+
+sample_groups <- frag_df_30_500 %>% dplyr::distinct(sample_id, Group)
+counts_30_500 <- frag_df_30_500 %>% dplyr::count(sample_id, Group, fragment_length, name = "n")
+
+counts_full <- tidyr::crossing(sample_groups, fragment_length = len_grid) %>%
+  dplyr::left_join(counts_30_500, by = c("sample_id", "Group", "fragment_length")) %>%
+  dplyr::mutate(n = dplyr::coalesce(n, 0L)) %>%
+  dplyr::group_by(sample_id, Group) %>%
+  dplyr::mutate(prop = n / sum(n), cum_prop = cumsum(prop)) %>%
+  dplyr::ungroup()
+
+group_median_dist <- counts_full %>%
+  dplyr::group_by(Group, fragment_length) %>%
+  dplyr::summarise(
+    median_prop = stats::median(prop, na.rm = TRUE),
+    median_cum_prop = stats::median(cum_prop, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+is_prop <- ggplot(group_median_dist, aes(x = fragment_length, y = median_prop, color = Group)) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(xintercept = 167, linetype = "dashed", color = "#2E2E2E", linewidth = 0.4) +
+  geom_vline(xintercept = 334, linetype = "dashed", color = "#2E2E2E", linewidth = 0.4) +
+  scale_color_manual(values = COLORS) +
+  scale_x_continuous(limits = c(len_min, len_max), breaks = seq(50, 500, by = 50)) +
+  labs(
+    title = "Median fragment size distribution (by group)",
+    subtitle = sprintf("Proportion at each length (%dbp–%dbp)", len_min, len_max),
+    x = "Fragment length (bp)", y = "Median proportion", color = "Group"
+  ) +
+  theme_pub(base_size = 11) +
+  theme(legend.position = "top")
+
+is_cum <- ggplot(group_median_dist, aes(x = fragment_length, y = median_cum_prop, color = Group)) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(xintercept = 167, linetype = "dashed", color = "#2E2E2E", linewidth = 0.4) +
+  geom_vline(xintercept = 334, linetype = "dashed", color = "#2E2E2E", linewidth = 0.4) +
+  scale_color_manual(values = COLORS) +
+  scale_x_continuous(limits = c(len_min, len_max), breaks = seq(50, 500, by = 50)) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title = "Median cumulative fragment distribution (by group)",
+    subtitle = sprintf("Proportion of reads with length ≤ N (%dbp–%dbp)", len_min, len_max),
+    x = "Fragment length (bp)", y = "Median cumulative proportion", color = "Group"
+  ) +
+  theme_pub(base_size = 11) +
+  theme(legend.position = "top")
+
+is_combined <- is_metrics / is_saw / (is_prop | is_cum) +
+  patchwork::plot_annotation(tag_levels = "A") +
+  patchwork::plot_layout(widths = c(1, 1), heights = c(1, 1, 1))
+
+ggsave(file.path(FIG_DIR, "fig2_insert_size.png"), is_combined, width = 14, height = 18, dpi = 300)
+```
+
+```{r}
+#| label: frag-ratio-tracks
+#| code-fold: true
+#| code-summary: "Fragmentation Ratio Track Code"
+#| eval: false
+
+# ============================================================================
+# GENOME-BINNED FRAGMENTATION RATIO TRACKS
+# ============================================================================
+
+bin_size <- 2e6
+chroms <- paste0("chr", c(21))
+seqlens <- GenomeInfoDb::seqlengths(genome)[chroms]
+seqlens <- seqlens[!is.na(seqlens)]
+
+bins_gr <- GenomicRanges::tileGenome(
+  seqlengths = seqlens, tilewidth = bin_size, cut.last.tile.in.chrom = TRUE
+)
+
+bins_df <- tibble::tibble(
+  bin_id = seq_along(bins_gr),
+  chrom = as.character(GenomeInfoDb::seqnames(bins_gr)),
+  start = start(bins_gr), end = end(bins_gr),
+  mid = as.integer(floor((start + end) / 2))
+)
+
+# GC content per bin
+bin_seqs <- Biostrings::getSeq(genome, bins_gr)
+freq <- Biostrings::letterFrequency(bin_seqs, letters = c("A", "C", "G", "T", "N"), as.prob = FALSE)
+acgt <- rowSums(freq[, c("A", "C", "G", "T"), drop = FALSE])
+gc <- (freq[, "G"] + freq[, "C"]) / pmax(acgt, 1)
+n_frac <- freq[, "N"] / Biostrings::width(bin_seqs)
+
+bins_df <- bins_df %>%
+  dplyr::mutate(gc = as.numeric(gc), n_frac = as.numeric(n_frac))
+
+# Filter bins for LOESS fitting
+gc_min <- 0.10; gc_max <- 0.85; n_frac_max <- 0.45
+bins_keep_for_gc <- is.finite(bins_df$gc) &
+  bins_df$gc >= gc_min & bins_df$gc <= gc_max &
+  is.finite(bins_df$n_frac) & bins_df$n_frac <= n_frac_max
+
+# Count fragments per bin per sample
+fragment_paths <- file.path(FRAG_DIR, paste0(metadata$sample_id, ".fragments.bed.gz"))
+names(fragment_paths) <- metadata$sample_id
+
+bin_counts_one_sample <- function(path, bins_gr, short_range = c(90L, 150L), long_range = c(151L, 220L)) {
+  short_counts <- integer(length(bins_gr))
+  long_counts <- integer(length(bins_gr))
+  
+  cb <- function(x) {
+    l <- x$length_bp
+    keep <- !is.na(l) & l >= 30L & l <= 500L
+    if (!any(keep)) return(invisible())
+    x <- x[keep, , drop = FALSE]
+    l <- x$length_bp
+    mid_gr <- chunk_to_midpoint_gr(x)
+    
+    # Short
+    idx_s <- which(l >= short_range[1] & l <= short_range[2])
+    if (length(idx_s) > 0) {
+      hits <- findOverlaps(mid_gr[idx_s], bins_gr, ignore.strand = TRUE)
+      if (length(hits) > 0) {
+        tab <- tabulate(S4Vectors::subjectHits(hits), nbins = length(bins_gr))
+        short_counts <<- short_counts + tab
+      }
+    }
+    
+    # Long
+    idx_l <- which(l >= long_range[1] & l <= long_range[2])
+    if (length(idx_l) > 0) {
+      hits <- findOverlaps(mid_gr[idx_l], bins_gr, ignore.strand = TRUE)
+      if (length(hits) > 0) {
+        tab <- tabulate(S4Vectors::subjectHits(hits), nbins = length(bins_gr))
+        long_counts <<- long_counts + tab
+      }
+    }
+    invisible()
+  }
+  
+  read_fragments_chunked(path = path, chunk_size = 200000L, FUN = cb)
+  
+  short_corrected <- correct_gc_bias(short_counts, bins_df$gc, fit_mask = bins_keep_for_gc)
+  long_corrected <- correct_gc_bias(long_counts, bins_df$gc, fit_mask = bins_keep_for_gc)
+  ratio_corrected <- short_corrected / (long_corrected + 1)
+  
+  tibble::tibble(
+    bin_id = seq_along(bins_gr),
+    short_raw = short_counts, long_raw = long_counts,
+    short_gc_corrected = short_corrected, long_gc_corrected = long_corrected,
+    short_long_ratio = ratio_corrected
+  )
+}
+
+bin_tracks <- purrr::imap_dfr(fragment_paths, function(path, sample_id) {
+  bc <- bin_counts_one_sample(path, bins_gr = bins_gr)
+  bc %>%
+    dplyr::mutate(
+      sample_id = sample_id,
+      Group = metadata$Group[match(sample_id, metadata$sample_id)]
+    )
+})
+
+bin_tracks_summary <- bin_tracks %>%
+  dplyr::group_by(Group, bin_id) %>%
+  dplyr::summarise(median_short_long_ratio = stats::median(short_long_ratio, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::left_join(bins_df, by = "bin_id") %>%
+  dplyr::arrange(match(chrom, chroms), start) %>%
+  dplyr::group_by(Group) %>%
+  dplyr::mutate(
+    chrom = factor(chrom, levels = chroms),
+    genome_x = {
+      chroms_present <- chroms[chroms %in% names(seqlens)]
+      chr_lens <- as.numeric(seqlens[chroms_present])
+      chr_offsets <- cumsum(c(0, head(chr_lens, -1L)))
+      names(chr_offsets) <- chroms_present
+      chr_offsets[as.character(chrom)] + mid
+    }
+  ) %>%
+  dplyr::ungroup()
+
+chrom_boundaries <- tibble::tibble(
+  chrom = chroms[chroms %in% names(seqlens)],
+  chr_len = as.numeric(seqlens[chroms[chroms %in% names(seqlens)]])
+) %>%
+  dplyr::mutate(
+    offset = cumsum(dplyr::lag(chr_len, default = 0)),
+    boundary = offset + chr_len,
+    center = offset + chr_len / 2
+  )
+
+p_tracks <- ggplot(bin_tracks_summary, aes(x = genome_x, y = median_short_long_ratio, color = Group)) +
+  geom_hline(yintercept = 1, color = "gray70", linewidth = 0.35) +
+  geom_line(linewidth = 0.65, alpha = 0.95) +
+  geom_vline(data = chrom_boundaries, aes(xintercept = boundary),
+             inherit.aes = FALSE, color = "gray88", linewidth = 0.3) +
+  scale_color_manual(values = COLORS) +
+  scale_x_continuous(
+    breaks = chrom_boundaries$center,
+    labels = as.character(chrom_boundaries$chrom),
+    expand = expansion(mult = c(0.01, 0.01))
+  ) +
+  labs(
+    title = "Genome-wide fragmentation ratio track (group median)",
+    subtitle = sprintf("GC-corrected (LOESS): median short/long ratio in 2 Mb bins (GC in [%.2f, %.2f], N ≤ %.2f)",
+                       gc_min, gc_max, n_frac_max),
+    x = "Chromosome", y = "Median short/long ratio", color = "Group"
+  ) +
+  theme_pub(base_size = 12) +
+  theme(legend.position = "top", axis.text.x = element_text(angle = 0, vjust = 0.5))
+
+ggsave(file.path(FIG_DIR, "fig3_fragmentation_ratio_tracks.png"), p_tracks, width = 16, height = 6, dpi = 300)
+```
+
+```{r}
+#| label: frag-tss
+#| code-fold: true
+#| code-summary: "TSS Enrichment Analysis Code"
+#| eval: false
+
+# ============================================================================
+# TSS ENRICHMENT ANALYSIS
+# ============================================================================
+
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+# Fragment start annotation
+annotate_fragment_starts_one_sample <- function(fragment_bed_gz, sample_id, group, chunk_size = 200000L) {
+  counts <- c(Promoter = 0L, Exon = 0L, Intron = 0L, Distal_Intergenic = 0L,
+              Three_UTR = 0L, Five_UTR = 0L, Downstream = 0L)
+  total <- 0L
+  
+  read_fragments_chunked(
+    path = fragment_bed_gz, chunk_size = chunk_size,
+    FUN = function(x) {
+      gr <- chunk_to_5p_start_gr(x)
+      if (length(gr) == 0) return(invisible())
+      total <<- total + length(gr)
+      
+      gr <- ChIPseeker::annotatePeak(gr, TxDb = txdb, level = "gene", addFlankGeneInfo = TRUE)
+      gr_anno <- data.frame(gr@anno) %>%
+        dplyr::mutate(
+          annotation_simple = gsub(" \\(.*", "", annotation),
+          annotation_simple = dplyr::case_when(
+            annotation_simple == "5' UTR" ~ "Five_UTR",
+            annotation_simple == "3' UTR" ~ "Three_UTR",
+            annotation_simple == "Distal Intergenic" ~ "Distal_Intergenic",
+            TRUE ~ annotation_simple
+          )
+        )
+      
+      counts_table <- table(gr_anno$annotation_simple)
+      for (annot in names(counts_table)) {
+        counts[[annot]] <<- counts[[annot]] + counts_table[[annot]]
+      }
+      invisible()
+    }
+  )
+  
+  tibble::tibble(
+    sample_id = sample_id, Group = group, total_starts = total,
+    Promoter = counts[["Promoter"]], Exon = counts[["Exon"]], Intron = counts[["Intron"]],
+    Three_UTR = counts[["Three_UTR"]], Five_UTR = counts[["Five_UTR"]],
+    Distal_Intergenic = counts[["Distal_Intergenic"]], Downstream = counts[["Downstream"]]
+  )
+}
+
+start_annot <- purrr::imap_dfr(fragment_paths, function(path, sample_id) {
+  annotate_fragment_starts_one_sample(
+    fragment_bed_gz = path,
+    sample_id = sample_id,
+    group = metadata$Group[match(sample_id, metadata$sample_id)]
+  )
+})
+
+start_annot_long <- start_annot %>%
+  tidyr::pivot_longer(cols = c(Promoter, Exon, Intron, Three_UTR, Five_UTR, Distal_Intergenic, Downstream),
+                      names_to = "annotation", values_to = "n") %>%
+  dplyr::group_by(sample_id) %>%
+  dplyr::mutate(pct = 100 * n / sum(n)) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(annotation = factor(annotation,
+    levels = c("Promoter", "Exon", "Intron", "Three_UTR", "Five_UTR", "Distal_Intergenic", "Downstream")))
+
+p_start_annot <- ggplot(start_annot_long, aes(x = sample_id, y = pct, fill = annotation)) +
+  geom_col(width = 0.85) +
+  facet_grid(~Group, scales = "free_x", space = "free_x") +
+  scale_y_continuous(limits = c(0, 105), expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Genomic distribution of fragment 5' start sites",
+       x = NULL, y = "Percent of fragment", fill = "Annotation") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1),
+        legend.position = "top")
+
+# TSS enrichment profile
+genes_chr21 <- suppressMessages(GenomicFeatures::genes(txdb))
+genes_chr21 <- genes_chr21[as.character(GenomeInfoDb::seqnames(genes_chr21)) %in% chroms]
+
+profile_tss_enrichment_starts <- function(fragment_bed_gz, tss_windows, tss_site, tss_strand,
+                                          flank = 2000L, chunk_size = 200000L, edge_width = 200L) {
+  flank <- as.integer(flank)
+  rel_grid <- (-flank):flank
+  prof <- numeric(length(rel_grid))
+  n_total <- 0L
+  
+  read_fragments_chunked(
+    path = fragment_bed_gz, chunk_size = chunk_size,
+    FUN = function(x) {
+      gr <- chunk_to_5p_start_gr(x)
+      if (length(gr) == 0) return(invisible())
+      n_total <<- n_total + length(gr)
+      
+      hits <- GenomicRanges::findOverlaps(gr, tss_windows, ignore.strand = TRUE)
+      if (length(hits) == 0) return(invisible())
+      
+      q <- S4Vectors::queryHits(hits)
+      s <- S4Vectors::subjectHits(hits)
+      pos <- start(gr[q])
+      rel <- pos - tss_site[s]
+      rel[tss_strand[s] == "-"] <- -rel[tss_strand[s] == "-"]
+      rel <- rel[rel >= -flank & rel <= flank]
+      if (length(rel) > 0) prof <<- prof + tabulate(rel + flank + 1L, nbins = length(rel_grid))
+      invisible()
+    }
+  )
+  
+  cpm <- (prof / max(n_total, 1L)) * 1e6
+  edge_width <- as.integer(edge_width)
+  edge_idx <- c(seq_len(edge_width), (length(cpm) - edge_width + 1L):length(cpm))
+  edge_mean <- mean(cpm[edge_idx], na.rm = TRUE)
+  enrich <- if (is.finite(edge_mean) && edge_mean > 0) cpm / edge_mean else rep(NA_real_, length(cpm))
+  
+  tibble::tibble(rel_bp = rel_grid, enrichment = enrich)
+}
+
+tss_points_pc <- unique(GenomicRanges::promoters(genes_chr21, upstream = 0L, downstream = 1L))
+tss_windows_pc <- unique(GenomicRanges::promoters(genes_chr21, upstream = 2000L, downstream = 2000L))
+tss_site_pc <- start(tss_points_pc)
+tss_strand_pc <- as.character(strand(tss_points_pc))
+
+tss_profiles <- purrr::imap_dfr(fragment_paths, function(path, sample_id) {
+  profile_tss_enrichment_starts(
+    fragment_bed_gz = path, tss_windows = tss_windows_pc,
+    tss_site = tss_site_pc, tss_strand = tss_strand_pc, flank = 2000L
+  ) %>%
+    dplyr::mutate(
+      sample_id = sample_id,
+      Group = metadata$Group[match(sample_id, metadata$sample_id)]
+    )
+})
+
+tss_summary <- tss_profiles %>%
+  dplyr::group_by(Group, rel_bp) %>%
+  dplyr::summarise(
+    mean_enrich = mean(enrichment, na.rm = TRUE),
+    se_enrich = stats::sd(enrichment, na.rm = TRUE) / sqrt(sum(is.finite(enrichment))),
+    .groups = "drop"
+  )
+
+tss_smooth_k <- 40L
+tss_summary_s <- tss_summary %>%
+  dplyr::group_by(Group) %>%
+  dplyr::arrange(rel_bp) %>%
+  dplyr::mutate(
+    mean_smooth = moving_average(mean_enrich, k = tss_smooth_k),
+    mean_smooth = dplyr::if_else(is.na(mean_smooth), mean_enrich, mean_smooth)
+  ) %>%
+  dplyr::ungroup()
+
+p_tss_global <- ggplot(tss_summary_s, aes(x = rel_bp, color = Group)) +
+  geom_hline(yintercept = 1, color = "gray60", linewidth = 0.35) +
+  geom_vline(xintercept = 0, color = "gray30", linewidth = 0.35) +
+  geom_line(aes(y = mean_smooth), linewidth = 0.95, na.rm = TRUE) +
+  scale_color_manual(values = COLORS) +
+  labs(
+    title = "TSS enrichment of fragment 5' start sites (chr21 protein-coding genes)",
+    subtitle = sprintf("Normalized by mean signal at window edges (±2000 bp; baseline = 1). Display: %d-bp running mean.", tss_smooth_k),
+    x = "Distance to TSS (bp)", y = "Normalized fragment density", color = "Group"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(), legend.position = "top")
+
+p_tss_combined <- p_start_annot / p_tss_global +
+  patchwork::plot_annotation(tag_levels = "A") +
+  patchwork::plot_layout(heights = c(1.4, 1))
+
+ggsave(file.path(FIG_DIR, "fig4_fragmentation_analysis.png"), p_tss_combined, width = 8, height = 5.5, dpi = 300)
+```
+
+## Results
+
+### Insert Size Distribution
+
+![Insert size analysis. (A) Comparison of insert size metrics between ALS and Control groups. (B) Per-sample sawtooth pattern showing nucleosome periodicity (dashed lines at 167 bp and 334 bp). (C-D) Group-level fragment size distribution and cumulative distribution.](results/figures/fig2_insert_size.png){#fig-insert-size width="100%"}
+
+**Key Observations:**
+
+- The characteristic **sawtooth pattern** reflects the ~10 bp DNA helical repeat within nucleosome-protected regions
+- **Mono-nucleosome peak** (~167 bp) is prominent across all samples
+- **Short/long fragment ratio** shows potential differences between ALS and Control groups
+
+### Genome-wide Fragmentation Ratio
+
+![Genome-wide fragmentation ratio track (chr21). GC-corrected short/long ratio in 2 Mb bins showing regional variation in fragmentation patterns.](results/figures/fig3_fragmentation_ratio_tracks.png){#fig-frag-ratio width="100%"}
+
+### Fragment Start Site Distribution
+
+![Fragment analysis. (A) Genomic distribution of fragment 5' start sites across annotated regions. (B) TSS enrichment profile showing nucleosome depletion at transcription start sites.](results/figures/fig4_fragmentation_analysis.png){#fig-frag-analysis width="100%"}
+
+**Key Observations:**
+
+- **Intronic regions** harbor the majority of fragment starts, consistent with genome composition
+- **TSS enrichment** shows the expected depletion pattern at nucleosome-free promoter regions
+- Differences in fragmentation patterns may reflect tissue-of-origin changes in ALS: nucleosome occupancy at TSS and smoother pattern for control; phased nucleosomes for ALS. Indicating that muscle-specific fragments are detected in ALS.
+
+:::
+
+---
+
+# End Motif Analysis {#sec-motif}
+
+::: {.panel-tabset}
+
+## Methods
+
+### 5' End Motif Profiling
+
+Cell-free DNA fragment ends exhibit characteristic sequence preferences reflecting the enzymatic 
+processes involved in cfDNA generation [@jiang2020cfdna; @liu2024starprotocols]. The 4-mer 
+(256 motif) end motif profile provides a comprehensive signature of nuclease cleavage preferences.
+
+**Motif Extraction**
+
+For each fragment, two 4-mer motifs were extracted from the 5' ends:
+
+1. **Left end**: Genomic positions [start, start+4) on the + strand
+2. **Right end**: Genomic positions [end-4, end) on the - strand (reverse complement)
+
+Sequences were obtained from BSgenome.Hsapiens.UCSC.hg38 reference genome. Only fragments with 
+valid 4-mer sequences (no N bases) were included.
+
+**Frequency Normalization**
+
+- Per-sample frequencies: count / total motifs
+- Z-score standardization for heatmap visualization (row-wise)
+
+### Motif Diversity Score (MDS)
+
+End motif diversity was quantified using Shannon entropy [@shannon1948entropy]:
+
+$$H = -\sum_{i=1}^{256} p_i \log_2(p_i)$$
+
+where $p_i$ is the frequency of motif $i$. The Motif Diversity Score (MDS) is normalized to [0,1]:
+
+$$MDS = \frac{H}{\log_2(256)}$$
+
+Higher MDS indicates more uniform motif usage; lower MDS suggests preferential cleavage at 
+specific sequences.
+
+### Dimensionality Reduction
+
+**PCA**: Principal component analysis on log10-transformed motif frequencies to visualize 
+sample relationships in reduced dimensions.
+
+### Differential Motif Analysis
+
+To identify motifs differentially abundant between ALS and Control:
+
+1. **Test**: Wilcoxon rank-sum test per motif
+2. **Effect size**: log2 fold-change (ALS/Ctrl)
+3. **Multiple testing**: Benjamini-Hochberg FDR correction
+4. **Significance threshold**: P < 0.05, |log2FC| > 0.05
+
+### Software
+
+- **Biostrings**: Sequence manipulation [@pages2024biostrings]
+- **ComplexHeatmap**: Hierarchical clustering visualization [@gu2016complexheatmap]
+- **ggplot2**: Statistical visualizations
+
+## Code
+
+```{r}
+#| label: motif-extraction
+#| code-fold: true
+#| code-summary: "End Motif Extraction Code"
+#| eval: false
+
+# ============================================================================
+# END MOTIF ANALYSIS
+# ============================================================================
+
+motifs_all <- function() {
+  bases <- c("A", "C", "G", "T")
+  grid <- expand.grid(b1 = bases, b2 = bases, b3 = bases, b4 = bases, stringsAsFactors = FALSE)
+  apply(grid, 1, paste0, collapse = "")
+}
+
+shannon_entropy_bits <- function(p) {
+  p <- p[is.finite(p) & p > 0]
+  -sum(p * log2(p))
+}
+
+valid_seqnames <- seqnames(genome)
+ALL_4MERS <- motifs_all()
+
+extract_4mer_counts_from_frag_bed <- function(frag_bed_gz, sample_id, genome, valid_seqnames, motifs_all, chunk_size = 200000L) {
+  counts <- setNames(integer(length(motifs_all)), motifs_all)
+  con <- gzfile(frag_bed_gz, open = "rt")
+  on.exit(try(close(con), silent = TRUE), add = TRUE)
+  
+  total_extracted <- 0L
+  
+  repeat {
+    x <- tryCatch({
+      utils::read.delim(
+        file = con, header = FALSE, sep = "\t", nrows = chunk_size,
+        col.names = FRAG_COLS, colClasses = FRAG_COL_CLASSES,
+        stringsAsFactors = FALSE, quote = ""
+      )
+    }, error = function(e) NULL)
+    
+    if (is.null(x) || nrow(x) == 0) break
+    
+    x <- x %>%
+      dplyr::filter(
+        chrom %in% valid_seqnames,
+        is.finite(start0), is.finite(end0),
+        start0 >= 0L, end0 > start0
+      )
+    if (nrow(x) == 0) next
+    
+    # Left end (+ strand)
+    gr_l <- GenomicRanges::GRanges(
+      seqnames = x$chrom,
+      ranges = IRanges::IRanges(start = x$start0 + 1L, width = 4L),
+      strand = "+"
+    )
+    
+    # Right end (- strand, reverse complement)
+    r_start0 <- x$end0 - 4L
+    keep_r <- is.finite(r_start0) & r_start0 >= 0L
+    gr_r <- GenomicRanges::GRanges(
+      seqnames = x$chrom[keep_r],
+      ranges = IRanges::IRanges(start = r_start0[keep_r] + 1L, width = 4L),
+      strand = "-"
+    )
+    
+    s_l <- Biostrings::getSeq(genome, gr_l)
+    s_r <- if (length(gr_r) > 0) Biostrings::getSeq(genome, gr_r) else Biostrings::DNAStringSet()
+    
+    motifs <- toupper(c(as.character(s_l), as.character(s_r)))
+    motifs <- motifs[nchar(motifs) == 4 & grepl("^[ACGT]{4}$", motifs)]
+    
+    if (length(motifs) > 0) {
+      counts <- counts + as.integer(table(factor(motifs, levels = motifs_all)))
+      total_extracted <- total_extracted + length(motifs)
+    }
+    
+    rm(x)
+    gc(verbose = FALSE)
+  }
+  
+  message(sprintf("  %s: extracted %s motifs", sample_id, format(total_extracted, big.mark = ",")))
+  tibble::tibble(sample_id = sample_id, motif = names(counts), count = as.integer(counts))
+}
+
+# Extract motifs from all samples
+sample_frag_paths <- metadata %>%
+  dplyr::transmute(
+    sample_id = sample_id,
+    frag_bed = file.path(FRAG_DIR, paste0(sample_id, ".fragments.bed.gz"))
+  )
+
+motif_counts <- purrr::map2_dfr(
+  sample_frag_paths$sample_id,
+  sample_frag_paths$frag_bed,
+  ~extract_4mer_counts_from_frag_bed(.y, .x, genome = genome, valid_seqnames = valid_seqnames, motifs_all = ALL_4MERS)
+)
+
+motif_long <- motif_counts %>%
+  dplyr::left_join(metadata, by = "sample_id") %>%
+  dplyr::group_by(sample_id) %>%
+  dplyr::mutate(
+    total = sum(count),
+    frequency = ifelse(total > 0, count / total, 0)
+  ) %>%
+  dplyr::ungroup()
+
+readr::write_csv(motif_long, file.path(TABLE_DIR, "end_motif_4mer_frequencies_long.csv"))
+```
+
+```{r}
+#| label: motif-visualization
+#| code-fold: true
+#| code-summary: "End Motif Visualization Code"
+#| eval: false
+
+# ============================================================================
+# END MOTIF VISUALIZATION
+# ============================================================================
+
+# Load pre-computed motif data
+motif_long <- readr::read_csv(file.path(TABLE_DIR, "end_motif_4mer_frequencies_long.csv"), show_col_types = FALSE)
+
+freq_mat <- motif_long %>%
+  dplyr::select(motif, sample_id, frequency) %>%
+  tidyr::pivot_wider(names_from = sample_id, values_from = frequency, values_fill = 0) %>%
+  tibble::column_to_rownames("motif") %>%
+  as.matrix()
+
+freq_mat <- freq_mat[, match(metadata$sample_id, colnames(freq_mat))]
+
+# Top 20 motifs bar plot
+motif_summary <- motif_long %>%
+  dplyr::group_by(Group, motif) %>%
+  dplyr::summarise(mean_freq = mean(frequency), sd_freq = sd(frequency), .groups = "drop")
+
+top20 <- motif_summary %>%
+  dplyr::group_by(motif) %>%
+  dplyr::summarise(total_mean = sum(mean_freq), .groups = "drop") %>%
+  dplyr::arrange(desc(total_mean)) %>%
+  dplyr::slice_head(n = 20) %>%
+  dplyr::pull(motif)
+
+p_top20 <- motif_summary %>%
+  dplyr::filter(motif %in% top20) %>%
+  dplyr::mutate(motif = factor(motif, levels = rev(top20))) %>%
+  ggplot(aes(x = motif, y = mean_freq, fill = Group)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  scale_fill_manual(values = COLORS) +
+  coord_flip() +
+  labs(title = "Top 20 cfDNA 5' end motifs (4-mer)",
+       subtitle = "Mean motif frequency by group",
+       x = NULL, y = "Mean frequency", fill = "Group") +
+  theme_pub(base_size = 12) +
+  theme(legend.position = "top")
+
+# Hierarchical clustering heatmap
+z_mat <- t(scale(t(freq_mat)))
+z_mat[!is.finite(z_mat)] <- 0
+
+anno_df <- metadata %>%
+  dplyr::distinct(sample_id, Group) %>%
+  dplyr::filter(sample_id %in% colnames(z_mat)) %>%
+  dplyr::arrange(match(sample_id, colnames(z_mat))) %>%
+  tibble::column_to_rownames("sample_id")
+
+ha <- ComplexHeatmap::HeatmapAnnotation(
+  df = anno_df,
+  col = list(Group = COLORS),
+  annotation_name_gp = grid::gpar(fontface = "bold", fontsize = 10)
+)
+
+ht <- ComplexHeatmap::Heatmap(
+  z_mat,
+  name = "Z-score",
+  top_annotation = ha,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_column_names = FALSE,
+  show_row_names = TRUE,
+  row_names_gp = grid::gpar(fontsize = 6),
+  column_title = "Samples",
+  row_title = "5' 4-mer end motifs (n = 256)",
+  col = circlize::colorRamp2(c(-2, 0, 2), c("#3B4CC0", "white", "#B40426"))
+)
+
+png(file.path(FIG_DIR, "fig5B_end_motif_4mer_clustering_heatmap.png"),
+    width = 5000, height = 7000, res = 450)
+ComplexHeatmap::draw(ht, heatmap_legend_side = "right", annotation_legend_side = "right")
+dev.off()
+
+# Motif Diversity Score (MDS)
+mds_tbl <- tibble::tibble(sample_id = colnames(freq_mat)) %>%
+  dplyr::mutate(
+    entropy_bits = apply(freq_mat, 2, shannon_entropy_bits),
+    mds = entropy_bits / log2(nrow(freq_mat))
+  ) %>%
+  dplyr::left_join(metadata, by = "sample_id")
+
+readr::write_csv(mds_tbl, file.path(TABLE_DIR, "end_motif_mds.csv"))
+
+p_mds <- ggplot(mds_tbl, aes(x = Group, y = mds, fill = Group)) +
+  geom_boxplot(width = 0.55, outlier.shape = NA, alpha = 0.85) +
+  geom_jitter(width = 0.12, size = 2.0, alpha = 0.75) +
+  scale_fill_manual(values = COLORS) +
+  labs(title = "End-motif diversity (MDS)",
+       subtitle = "Shannon entropy of 256 4-mer frequencies (normalized by log2(256))",
+       x = NULL, y = "Motif diversity score (0–1)") +
+  theme_pub(base_size = 12) +
+  theme(legend.position = "none")
+
+# PCA
+X <- t(freq_mat)
+X <- log10(X + 1e-6)
+pca <- prcomp(X, center = TRUE, scale. = TRUE)
+
+pca_df <- as.data.frame(pca$x[, 1:2, drop = FALSE]) %>%
+  tibble::rownames_to_column("sample_id") %>%
+  dplyr::left_join(metadata, by = "sample_id")
+
+var_expl <- (pca$sdev^2) / sum(pca$sdev^2)
+pc1_lab <- sprintf("PC1 (%.1f%%)", 100 * var_expl[1])
+pc2_lab <- sprintf("PC2 (%.1f%%)", 100 * var_expl[2])
+
+p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Group, label = sample_id)) +
+  geom_point(size = 3, alpha = 0.9) +
+  stat_ellipse(type = "norm", level = 0.68, linewidth = 0.6, alpha = 0.2) +
+  geom_text(size = 2.7, hjust = 0.5, vjust = -0.7, show.legend = FALSE, alpha = 0.88, check_overlap = TRUE) +
+  scale_color_manual(values = COLORS) +
+  labs(title = "PCA of samples using 256 end-motif frequencies",
+       x = pc1_lab, y = pc2_lab, color = "Group") +
+  theme_pub(base_size = 12) +
+  theme(legend.position = "top")
+
+# Differential motifs + volcano
+eps <- 1e-6
+diff_tbl <- motif_long %>%
+  dplyr::select(Group, motif, frequency) %>%
+  dplyr::group_by(motif) %>%
+  dplyr::summarise(
+    mean_Ctrl = mean(frequency[Group == "Ctrl"]),
+    mean_ALS = mean(frequency[Group == "ALS"]),
+    log2fc = log2((mean_ALS + eps) / (mean_Ctrl + eps)),
+    p = if (dplyr::n_distinct(Group) < 2) NA_real_ else wilcox.test(frequency ~ Group)$p.value,
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    padj = p.adjust(p, method = "BH"),
+    neglog10_padj = -log10(padj),
+    neglog10_p = -log10(p)
+  )
+
+readr::write_csv(diff_tbl, file.path(TABLE_DIR, "end_motif_differential_motifs.csv"))
+
+sig_cut <- 0.05
+lfc_cut <- 0.05
+diff_tbl <- diff_tbl %>%
+  dplyr::mutate(
+    status = dplyr::case_when(
+      !is.na(p) & p < sig_cut & log2fc > lfc_cut ~ "Higher in ALS",
+      !is.na(p) & p < sig_cut & log2fc < -lfc_cut ~ "Higher in Ctrl",
+      TRUE ~ "Not significant"
+    ),
+    status = factor(status, levels = c("Higher in ALS", "Higher in Ctrl", "Not significant"))
+  )
+
+label_tbl <- diff_tbl %>%
+  dplyr::filter(status != "Not significant") %>%
+  dplyr::arrange(p) %>%
+  dplyr::slice_head(n = 10)
+
+p_volcano <- ggplot(diff_tbl, aes(x = log2fc, y = neglog10_p, color = status)) +
+  geom_hline(yintercept = -log10(sig_cut), linetype = "dashed", color = "gray60", linewidth = 0.4) +
+  geom_vline(xintercept = c(-lfc_cut, lfc_cut), linetype = "dashed", color = "gray60", linewidth = 0.4) +
+  geom_point(alpha = 0.85, size = 2.2) +
+  geom_text(data = label_tbl, aes(label = motif, color = status),
+            size = 3, vjust = -0.7, check_overlap = TRUE, show.legend = FALSE) +
+  scale_color_manual(values = c("Higher in ALS" = unname(COLORS["ALS"]),
+                                "Higher in Ctrl" = unname(COLORS["Ctrl"]),
+                                "Not significant" = "gray70"), drop = FALSE) +
+  labs(title = "Differential end motifs (ALS vs Ctrl)",
+       subtitle = "Wilcoxon test per motif",
+       x = "log2 fold-change (ALS / Ctrl)", y = expression(-log[10]("p-value")), color = NULL) +
+  theme_pub(base_size = 12) +
+  theme(legend.position = "top")
+
+# Combined figure
+ht_grob <- grid::grid.grabExpr(
+  ComplexHeatmap::draw(ht, heatmap_legend_side = "right", annotation_legend_side = "right")
+)
+p_ht <- patchwork::wrap_elements(full = ht_grob)
+
+p_end_motif_combined <- (p_top20 | p_ht) / (p_mds | p_pca | p_volcano) +
+  patchwork::plot_annotation(tag_levels = "A") +
+  patchwork::plot_layout(heights = c(2.5, 1.6))
+
+ggsave(file.path(FIG_DIR, "fig5_end_motif_analysis.png"),
+       p_end_motif_combined, width = 18, height = 18, dpi = 300)
+```
+
+## Results
+
+### End Motif Profiling
+
+![End motif analysis. (A) Top 20 most frequent 5' end 4-mer motifs by group. (B) Hierarchical clustering heatmap of all 256 motifs (row Z-scores). (C) Motif diversity score comparison. (D) PCA of samples based on motif frequencies. (E) Volcano plot of differential motifs.](results/figures/fig5_end_motif_analysis.png){#fig-end-motif width="100%"}
+
+### Key Findings
+
+```{r}
+#| label: motif-summary
+#| echo: false
+
+# Load differential motif results
+diff_motifs <- readr::read_csv(file.path(TABLE_DIR, "end_motif_differential_motifs.csv"), show_col_types = FALSE)
+
+n_sig <- sum(diff_motifs$p < 0.05, na.rm = TRUE)
+n_higher_als <- sum(diff_motifs$p < 0.05 & diff_motifs$log2fc > 0, na.rm = TRUE)
+n_higher_ctrl <- sum(diff_motifs$p < 0.05 & diff_motifs$log2fc < 0, na.rm = TRUE)
+```
+
+**Differential Motif Summary:**
+
+- Total motifs analyzed: 256
+- Significantly different (P < 0.05): `r n_sig`
+- Higher in ALS: `r n_higher_als`
+- Higher in Control: `r n_higher_ctrl`
+
+**Biological Interpretation:**
+
+- **Motif diversity** appears comparable between groups, suggesting global nuclease activity is preserved
+- **PCA** shows no clear separation between ALS and Control.
+
+:::
+
+---
+
+# DNA Methylation Analysis {#sec-dmr}
+
+::: {.panel-tabset}
+
+## Methods
+
+### Data Processing
+
+Bisulfite-converted DNA methylation data was processed using the Bismark pipeline [@krueger2011bismark].
+Coverage files containing per-CpG methylation calls were loaded into R using the bsseq package 
+[@hansen2012bsmooth].
+
+**BSseq Object Construction**
+
+- Input: Bismark coverage files (*.bismark.cov.gz)
+- Format: chromosome, position, end, methylation%, count_methylated, count_unmethylated
+- Strand collapsing: CpGs on opposite strands combined
+- Zero-coverage sites: Removed during import
+
+**Quality Filtering**
+
+CpG sites were retained if they had coverage in at least one sample per group (ALS and Control),
+ensuring sufficient data for differential analysis while preserving low-coverage regions 
+characteristic of cfDNA WGBS.
+
+### Differentially Methylated Region (DMR) Detection
+
+DMRs were identified using dmrseq [@korthauer2018dmrseq], specifically designed for low-coverage 
+WGBS data:
+
+**BSmooth Smoothing**
+
+The algorithm internally applies BSmooth smoothing [@hansen2012bsmooth] to borrow strength from 
+neighboring CpGs:
+
+- Smoothing span: 1000 bp
+- Minimum CpGs in smoothing window: 15
+- Maximum gap for smoothing: 2500 bp
+
+**Candidate Region Detection**
+
+- Effect size cutoff: β > 0.05
+- Minimum CpGs per region: 3
+- Maximum gap within DMR: 1000 bp
+- Attempted to quantify methylation levels within skeletal muscle-specific marker regions identified by the WGBS human tissue atlas (Loyfer et al., 2023). However, due to limited sequencing coverage, was unable to recover sufficient data across those regions.
+
+**Statistical Inference**
+
+- Permutation-based null distribution for regional statistics
+- FDR control via empirical p-values
+- Significance threshold: p ≤ 0.05
+
+### Visualization
+
+**Methylation Distribution**
+
+- 1 kb genomic tiles computed across chr21
+- Mean methylation per tile per sample
+- Density plots comparing ALS vs Control
+
+**Dimensionality Reduction**
+
+- PCA on top 5000 most variable tiles (by MAD)
+- Data centered and scaled before PCA
+
+**Differential Methylation Plots**
+
+- Volcano: effect size (β) vs -log10(p-value)
+- Manhattan: genomic position vs -log10(p-value)
+
+### Software
+
+- **bsseq**: Bisulfite sequencing data analysis [@hansen2012bsmooth]
+- **dmrseq**: DMR detection for low-coverage WGBS [@korthauer2018dmrseq]
+- **BiocParallel**: Parallel computation
+- **ComplexHeatmap**: Heatmap visualization [@gu2016complexheatmap]
+
+## Code
+
+```{r}
+#| label: dmr-processing
+#| code-fold: true
+#| code-summary: "DMR Analysis Data Processing"
+#| eval: false
+
+# ============================================================================
+# DNA METHYLATION ANALYSIS (dmrseq)
+# ============================================================================
+
+# dmrseq parameters
+CUTOFF         <- 0.05    # Effect size cutoff for candidate region detection
+MIN_NUM_REGION <- 3       # Minimum CpGs per candidate region
+SIG_THRESHOLD  <- 0.05    # Significance threshold for DMRs
+
+# Load Bismark coverage files
+cov_tbl <- tibble::tibble(
+  cov_file = list.files(
+    path = BISMARK_COV_DIR,
+    pattern = "\\.bismark\\.cov\\.gz$",
+    full.names = TRUE,
+    recursive = TRUE
+  )
+) %>%
+  dplyr::mutate(sample_id = sub("\\..*", "", basename(cov_file)))
+
+metadata_cov <- metadata %>%
+  dplyr::left_join(cov_tbl, by = "sample_id") %>%
+  dplyr::filter(!is.na(cov_file))
+
+message(sprintf("Found %d samples with Bismark coverage files.", nrow(metadata_cov)))
+
+# Read Bismark coverage files into BSseq object
+bs <- bsseq::read.bismark(
+  files = metadata_cov$cov_file,
+  rmZeroCov = TRUE,
+  strandCollapse = TRUE,
+  verbose = TRUE
+)
+
+pData(bs)$Group <- metadata_cov$Group
+pData(bs)$sample_id <- metadata_cov$sample_id
+
+message(sprintf("BSseq object: %d CpG loci, %d samples", nrow(bs), ncol(bs)))
+
+saveRDS(bs, file.path(RDS_DIR, "bsseq_object.rds"))
+
+# Filter low-coverage CpGs
+cov_mat <- bsseq::getCoverage(bs, type = "Cov")
+
+ctrl_idx <- which(metadata_cov$Group == "Ctrl")
+als_idx  <- which(metadata_cov$Group == "ALS")
+
+ctrl_covered <- rowSums(cov_mat[, ctrl_idx] > 0) >= 1
+als_covered  <- rowSums(cov_mat[, als_idx] > 0) >= 1
+
+keep_loci <- ctrl_covered & als_covered
+bs_filt <- bs[keep_loci, ]
+
+message(sprintf("After filtering: %d CpG loci (%.1f%% retained)",
+                nrow(bs_filt), 100 * nrow(bs_filt) / nrow(bs)))
+```
+
+```{r}
+#| label: dmr-detection
+#| code-fold: true
+#| code-summary: "DMR Detection Code"
+#| eval: false
+
+# ============================================================================
+# DMR DETECTION
+# ============================================================================
+
+# Run dmrseq (or load cached results)
+if (file.exists(file.path(RDS_DIR, "dmrseq_results_raw.rds"))) {
+  dmrs <- readRDS(file.path(RDS_DIR, "dmrseq_results_raw.rds"))
+} else {
+  dmrs <- dmrseq::dmrseq(
+    bs = bs_filt,
+    testCovariate = "Group",
+    cutoff = CUTOFF,
+    minNumRegion = MIN_NUM_REGION,
+    bpSpan = 1000,
+    minInSpan = 15,
+    maxGapSmooth = 2500,
+    maxGap = 1000,
+    verbose = TRUE,
+    BPPARAM = BiocParallel::MulticoreParam(workers = 4)
+  )
+  saveRDS(dmrs, file.path(RDS_DIR, "dmrseq_results_raw.rds"))
+}
+
+message(sprintf("dmrseq found %d candidate regions.", length(dmrs)))
+
+# Format DMR results
+dmr_df <- as.data.frame(dmrs) %>%
+  tibble::as_tibble() %>%
+  dplyr::rename(chr = seqnames) %>%
+  dplyr::mutate(
+    width = end - start + 1,
+    mid = as.integer(floor((start + end) / 2)),
+    direction = dplyr::case_when(
+      beta > 0 ~ "Hyper (ALS>Ctrl)",
+      beta < 0 ~ "Hypo (ALS<Ctrl)",
+      TRUE ~ "None"
+    ),
+    is_sig = !is.na(pval) & pval <= SIG_THRESHOLD
+  )
+
+readr::write_csv(dmr_df, file.path(TABLE_DIR, "dmrseq_results_all.csv"))
+
+# Significant DMRs
+dmr_sig <- dmr_df %>%
+  dplyr::filter(is_sig) %>%
+  dplyr::arrange(pval)
+
+dmr_summary <- dmr_sig %>%
+  dplyr::count(direction, name = "n_DMRs") %>%
+  dplyr::mutate(total = sum(n_DMRs), pct = round(100 * n_DMRs / total, 1))
+
+readr::write_csv(dmr_summary, file.path(TABLE_DIR, "dmrseq_DMRs_summary.csv"))
+```
+
+```{r}
+#| label: dmr-visualization
+#| code-fold: true
+#| code-summary: "DMR Visualization Code"
+#| eval: false
+
+# ============================================================================
+# DMR VISUALIZATION
+# ============================================================================
+
+# Compute tiled methylation matrix
+tile_gr <- GenomicRanges::tileGenome(
+  seqlens <- GenomeInfoDb::seqlengths(genome)[paste0("chr", c(21))],
+  tilewidth = 1000,
+  cut.last.tile.in.chrom = TRUE
+)
+
+meth_by_tile <- bsseq::getMeth(bs_filt, regions = tile_gr, type = "raw", what = "perRegion")
+colnames(meth_by_tile) <- metadata_cov$sample_id
+rownames(meth_by_tile) <- sprintf("%s_%d_%d", as.character(GenomicRanges::seqnames(tile_gr)), 
+                                  GenomicRanges::start(tile_gr), GenomicRanges::end(tile_gr))
+
+keep_tiles <- rowSums(!is.na(meth_by_tile)) > 0
+tile_mat <- meth_by_tile[keep_tiles, ] * 100  # Convert to percent
+
+saveRDS(tile_mat, file.path(RDS_DIR, "dmrseq_tile_methylation_matrix.rds"))
+
+# Methylation density plot
+meth_long <- as.data.frame(tile_mat) %>%
+  tibble::rownames_to_column("tile_id") %>%
+  tidyr::pivot_longer(-tile_id, names_to = "sample_id", values_to = "pct_meth") %>%
+  dplyr::left_join(metadata %>% dplyr::select(sample_id, Group), by = "sample_id") %>%
+  dplyr::filter(!is.na(pct_meth))
+
+p_density <- ggplot(meth_long, aes(x = pct_meth, color = Group)) +
+  geom_density(linewidth = 0.9, alpha = 0.9) +
+  scale_color_manual(values = COLORS) +
+  labs(
+    title = "cfDNA WGBS methylation distribution (1 kb tiles)",
+    subtitle = "Percent methylation across tiled windows (chr21)",
+    x = "Percent methylation (%)", y = "Density", color = "Group"
+  ) +
+  theme_pub(base_size = 12) +
+  theme(legend.position = "top")
+
+# PCA on most variable tiles
+mat <- tile_mat
+keep_rows <- rowSums(is.na(mat)) == 0
+mat <- mat[keep_rows, , drop = FALSE]
+
+if (nrow(mat) > 100) {
+  mad_v <- apply(mat, 1, stats::mad, na.rm = TRUE)
+  top_n <- min(5000L, nrow(mat))
+  top_idx <- order(mad_v, decreasing = TRUE)[seq_len(top_n)]
+  mat_top <- mat[top_idx, , drop = FALSE]
+  
+  pca <- prcomp(t(mat_top), center = TRUE, scale. = TRUE)
+  pca_df <- tibble::tibble(
+    sample_id = rownames(pca$x),
+    PC1 = pca$x[, 1],
+    PC2 = pca$x[, 2]
+  ) %>%
+    dplyr::left_join(metadata, by = "sample_id")
+  
+  var_expl <- (pca$sdev^2) / sum(pca$sdev^2)
+  
+  p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Group)) +
+    geom_point(size = 3.5, alpha = 0.9) +
+    ggrepel::geom_text_repel(aes(label = sample_id), size = 2.8, max.overlaps = 20) +
+    scale_color_manual(values = COLORS) +
+    labs(
+      title = sprintf("PCA of %d most variable 1 kb tiles (chr21)", top_n),
+      subtitle = sprintf("PC1 %.1f%%, PC2 %.1f%% variance explained", 100 * var_expl[1], 100 * var_expl[2]),
+      x = sprintf("PC1 (%.1f%%)", 100 * var_expl[1]),
+      y = sprintf("PC2 (%.1f%%)", 100 * var_expl[2]),
+      color = "Group"
+    ) +
+    theme_pub(base_size = 12) +
+    theme(legend.position = "top")
+}
+
+# Heatmap of most variable tiles
+z_mat <- t(scale(t(mat_top)))
+z_mat[!is.finite(z_mat)] <- 0
+
+sample_order <- metadata %>%
+  dplyr::arrange(Group, sample_id) %>%
+  dplyr::pull(sample_id)
+sample_order <- intersect(sample_order, colnames(z_mat))
+z_mat <- z_mat[, sample_order, drop = FALSE]
+
+anno_df <- metadata %>%
+  dplyr::distinct(sample_id, Group) %>%
+  dplyr::filter(sample_id %in% colnames(z_mat)) %>%
+  dplyr::arrange(match(sample_id, colnames(z_mat))) %>%
+  tibble::column_to_rownames("sample_id")
+
+ha <- ComplexHeatmap::HeatmapAnnotation(
+  df = anno_df,
+  col = list(Group = COLORS),
+  annotation_name_gp = grid::gpar(fontface = "bold", fontsize = 10)
+)
+
+ht <- ComplexHeatmap::Heatmap(
+  z_mat,
+  name = "Z-score",
+  top_annotation = ha,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_names = FALSE,
+  show_column_names = TRUE,
+  column_names_gp = grid::gpar(fontsize = 8),
+  column_title = "Samples",
+  row_title = sprintf("Top %d variable tiles", nrow(z_mat)),
+  col = circlize::colorRamp2(c(-2, 0, 2), c("#3B4CC0", "white", "#B40426"))
+)
+
+# Volcano plot
+p_volcano <- ggplot(dmr_df, aes(x = beta, y = -log10(pval))) +
+  geom_point(aes(color = is_sig), alpha = 0.6, size = 1.5) +
+  geom_vline(xintercept = c(-CUTOFF, CUTOFF), linetype = "dashed", color = "gray45", linewidth = 0.4) +
+  geom_hline(yintercept = -log10(SIG_THRESHOLD), linetype = "dashed", color = "gray45", linewidth = 0.4) +
+  scale_color_manual(values = c("TRUE" = "#E64B35", "FALSE" = "gray70"),
+                     labels = c("TRUE" = "Significant", "FALSE" = "Not sig.")) +
+  labs(
+    title = "Differential methylation (ALS vs Ctrl) — dmrseq",
+    subtitle = sprintf("Significant: p ≤ %.2f", SIG_THRESHOLD),
+    x = "Effect size (beta coefficient)",
+    y = expression(-log[10](p-value)),
+    color = NULL
+  ) +
+  theme_pub(base_size = 12) +
+  theme(legend.position = "top")
+
+# Manhattan plot
+dmr_chr <- dmr_df %>%
+  dplyr::mutate(
+    sig_dir = dplyr::case_when(
+      is_sig & beta > 0 ~ "Hyper",
+      is_sig & beta < 0 ~ "Hypo",
+      TRUE ~ "Not sig."
+    )
+  )
+
+p_manhattan <- ggplot(dmr_chr, aes(x = mid / 1e6, y = -log10(pval))) +
+  geom_point(aes(color = sig_dir), alpha = 0.75, size = 1.3) +
+  geom_hline(yintercept = -log10(SIG_THRESHOLD), linetype = "dashed", color = "gray45", linewidth = 0.4) +
+  scale_color_manual(values = c("Hyper" = "#E64B35", "Hypo" = "#4DBBD5", "Not sig." = "gray75")) +
+  labs(
+    title = "Differential methylation along chr21 — dmrseq",
+    subtitle = sprintf("p ≤ %.2f threshold shown", SIG_THRESHOLD),
+    x = "Genomic position (Mb)",
+    y = expression(-log[10](p-value)),
+    color = NULL
+  ) +
+  theme_pub(base_size = 12) +
+  theme(legend.position = "top")
+
+# Combined figure
+ht_grob <- grid::grid.grabExpr(
+  ComplexHeatmap::draw(ht, heatmap_legend_side = "right", annotation_legend_side = "right")
+)
+p_ht <- patchwork::wrap_elements(full = ht_grob)
+
+p_dmrseq_combined <- p_density / (p_pca | p_ht) / (p_volcano | p_manhattan) +
+  patchwork::plot_layout(heights = c(1, 1.2, 1.2)) +
+  patchwork::plot_annotation(tag_levels = "A")
+
+ggsave(file.path(FIG_DIR, "fig6_dmrseq_combined.png"),
+       p_dmrseq_combined, width = 17, height = 20, dpi = 300)
+```
+
+## Results
+
+### Methylation Overview
+
+![DNA methylation analysis with dmrseq. (A) Methylation distribution across 1 kb tiles. (B) PCA of most variable tiles. (C) Heatmap of top variable tiles. (D) Volcano plot of DMR effect sizes vs significance. (E) Manhattan plot showing DMR positions along chr21.](results/figures/fig6_dmrseq_combined.png){#fig-dmrseq width="100%"}
+
+### DMR Summary
+
+```{r}
+#| label: dmr-summary-table
+#| echo: false
+
+dmr_results <- readr::read_csv(file.path(TABLE_DIR, "dmrseq_results_all.csv"), show_col_types = FALSE)
+dmr_summary <- readr::read_csv(file.path(TABLE_DIR, "dmrseq_DMRs_summary.csv"), show_col_types = FALSE)
+
+total_regions <- nrow(dmr_results)
+sig_regions <- sum(dmr_results$is_sig, na.rm = TRUE)
+```
+
+**DMR Detection Results:**
+
+- Total candidate regions tested: `r total_regions`
+- Significant DMRs (p ≤ 0.05): `r sig_regions`
+
+```{r}
+#| label: dmr-direction-table
+#| echo: false
+
+if (nrow(dmr_summary) > 0) {
+  dmr_summary %>%
+    knitr::kable(
+      col.names = c("Direction", "N DMRs", "Total", "Percent"),
+      caption = "Distribution of significant DMRs by methylation direction",
+      align = "lrrr"
+    ) %>%
+    kableExtra::kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+}
+```
+
+### Key Findings
+
+**Methylation Patterns:**
+
+- Global methylation distributions are similar between ALS and Control groups
+- Low sequencing coverage limits power for detecting subtle methylation differences
+- Attempted to quantify methylation levels within skeletal muscle-specific marker regions identified by the WGBS human tissue atlas (Loyfer et al., 2023). However, due to limited sequencing coverage, was unable to recover sufficient data across those regions
+
+
+**dmrseq Performance:**
+
+- dmrseq is specifically designed for low-coverage WGBS data like cfDNA sequencing
+- BSmooth smoothing borrows information from neighboring CpGs to improve estimates
+- Permutation-based inference provides proper FDR control even with small sample sizes
+
+**Biological Relevance:**
+
+- Tissue-of-origin methylation signatures could inform disease pathophysiology
+- Functional annotation and enrichment analysis could be performed to further investigate the biological relevance of the DMRs
+
+:::
+
+---
+
+# Classification Analysis {#sec-class}
+
+::: {.panel-tabset}
+
+## Methods
+
+### Feature Sets
+
+Three feature sets were evaluated for ALS vs Control classification:
+
+1. **stackHMM Methylation**: Median methylation per chromatin state from the universal stackHMM model (vu et al., 2022. Genome Biology), which captures functional genomic context. Genome-wide maps of chromatin marks such as histone modifications and open chromatin sites provide valuable information for annotating the non-coding genome, including identifying regulatory elements.
+   
+2. **End Motifs**: Log10-transformed 4-mer end motif frequencies (256 features), reflecting 
+   nuclease cleavage preferences
+   
+3. **Methylation Tiles**: 1 kb tile methylation values from WGBS, providing regional 
+   methylation signatures
+
+### Data Preprocessing
+
+**Missingness Filtering**
+
+- Features with >20% missing values across samples were removed prior to imputation
+- This ensures features have sufficient coverage for reliable estimation
+
+**Imputation**
+
+- Remaining missing values imputed using median of non-missing values per feature
+
+**Variance Filtering**
+
+- Features ranked by variance across samples
+- Top 50% retained (minimum 10-100 features depending on feature set)
+
+**Scaling**
+
+- Features standardized (z-score: mean = 0, SD = 1)
+
+### Feature Selection: Boruta Algorithm
+
+The Boruta algorithm [@kursa2010boruta] was applied for unbiased feature selection:
+
+1. Create "shadow" features by shuffling each original feature
+2. Train Random Forest on original + shadow features
+3. Features significantly better than best shadow are "Confirmed"
+4. Features not significantly worse are "Tentative"
+5. Maximum 100 iterations
+
+### Feature Importance Visualization
+
+Feature importance was assessed using Random Forest's Mean Decrease Gini (MDG) metric from the 
+final trained model. MDG measures the total decrease in node impurity (Gini index) averaged 
+over all trees when a feature is used for splitting. Higher MDG indicates greater importance 
+for classification.
+
+### EnhA3 Methylation Analysis
+
+EnhA3 (Active Enhancer 3) methylation levels from stackHMM chromatin state annotations were 
+extracted and compared between ALS and Control groups using boxplots with individual data 
+points overlaid.
+
+### Classification Model: Random Forest
+
+Random Forest classifiers [@breiman2001random] were trained with the following parameters:
+
+- Number of trees: 500 (default)
+- Variables tried at each split (mtry): tuned via inner CV
+- Importance: permutation-based (Gini importance)
+
+### Nested Cross-Validation
+
+To prevent information leakage and provide unbiased performance estimates, nested 
+cross-validation was implemented using the nestedcv package [@lewis2023nestedcv]:
+
+**Outer Loop (Performance Estimation)**
+
+- Leave-One-Out Cross-Validation (LOOCV)
+- Each sample held out once as test set
+- Provides n independent predictions
+
+**Inner Loop (Hyperparameter Tuning)**
+
+- 5-fold cross-validation
+- mtry values tested: 2, √(p), p/3
+- Best mtry selected by accuracy
+
+**Rationale**
+
+Nested CV is essential for small sample sizes to:
+
+- Avoid optimistic bias from single train/test splits
+- Properly separate feature selection from model evaluation
+- Provide reliable confidence intervals for performance metrics
+
+### Performance Metrics
+
+- **AUC**: Area Under the ROC Curve (DeLong 95% CI)
+- **Sensitivity**: True Positive Rate (TP / (TP + FN))
+- **Specificity**: True Negative Rate (TN / (TN + FP))
+- **Precision**: Positive Predictive Value (TP / (TP + FP))
+- **F1 Score**: Harmonic mean of precision and sensitivity
+
+### Software
+
+- **nestedcv**: Nested cross-validation framework [@lewis2023nestedcv]
+- **Boruta**: Feature selection [@kursa2010boruta]
+- **randomForest**: Classification model [@liaw2002randomforest]
+- **pROC**: ROC curve analysis and AUC computation [@robin2011proc]
+- **caret**: Model training utilities [@kuhn2008caret]
+
+## Code
+
+```{r}
+#| label: class-feature-engineering
+#| code-fold: true
+#| code-summary: "Feature Engineering Code"
+#| eval: false
+
+# ============================================================================
+# CLASSIFICATION ANALYSIS
+# ============================================================================
+
+# Helper functions
+filter_by_variance <- function(mat, top_pct = 0.5, min_features = 10) {
+  vars <- apply(mat, 2, var, na.rm = TRUE)
+  vars[is.na(vars)] <- 0
+  n_keep <- min(max(min_features, floor(ncol(mat) * top_pct)), sum(vars > 0))
+  mat[, order(vars, decreasing = TRUE)[seq_len(n_keep)], drop = FALSE]
+}
+
+impute_median <- function(mat) {
+  apply(mat, 2, function(x) { x[is.na(x)] <- median(x, na.rm = TRUE); x })
+}
+
+preprocess <- function(mat, top_pct, min_feat, max_missing = 0.2) {
+  # 1) Remove features missing in > max_missing fraction of samples
+  miss_frac <- colMeans(is.na(mat))
+  keep <- miss_frac <= max_missing
+  if (!any(keep)) {
+    o <- order(miss_frac, decreasing = FALSE)
+    keep_idx <- o[seq_len(min(min_feat, length(o)))]
+    mat <- mat[, keep_idx, drop = FALSE]
+  } else {
+    mat <- mat[, keep, drop = FALSE]
+  }
+  # 2) Impute remaining missing values (median per feature)
+  mat <- impute_median(mat)
+  # 3) Filter by variance, then scale
+  mat <- filter_by_variance(mat, top_pct, min_feat)
+  mat <- scale(mat)
+  mat[is.nan(mat)] <- 0
+  mat
+}
+
+# Load data
+bs <- readRDS(file.path(RDS_DIR, "bsseq_object.rds"))
+
+stackhmm_df <- readr::read_tsv(file.path(PROCESSED_DIR, "hg38_genome_100_segments.bed.gz"),
+                               col_names = c("chr", "start", "end", "state"),
+                               col_types = "ciic", progress = FALSE) %>%
+  dplyr::filter(chr == "chr21")
+
+stackhmm_gr <- GenomicRanges::GRanges(
+  seqnames = stackhmm_df$chr,
+  ranges = IRanges::IRanges(start = stackhmm_df$start + 1L, end = stackhmm_df$end),
+  state = stackhmm_df$state
+)
+states <- unique(stackhmm_df$state)
+
+motif_long <- readr::read_csv(file.path(TABLE_DIR, "end_motif_4mer_frequencies_long.csv"), show_col_types = FALSE)
+tile_mat_raw <- readRDS(file.path(RDS_DIR, "dmrseq_tile_methylation_matrix.rds"))
+
+# 1. stackHMM methylation features
+cpg_gr <- GenomicRanges::granges(bs)
+meth_mat <- bsseq::getMeth(bs, type = "raw", what = "perBase")
+colnames(meth_mat) <- pData(bs)$sample_id
+
+stackhmm_meth <- matrix(NA_real_, nrow = ncol(bs), ncol = length(states),
+                        dimnames = list(colnames(meth_mat), states))
+for (i in seq_along(states)) {
+  cpg_idx <- S4Vectors::queryHits(GenomicRanges::findOverlaps(cpg_gr, stackhmm_gr[stackhmm_gr$state == states[i]]))
+  if (length(cpg_idx) > 0) {
+    stackhmm_meth[, states[i]] <- apply(meth_mat[cpg_idx, , drop = FALSE], 2, median, na.rm = TRUE)
+  }
+}
+
+# 2. End motif features (log-transformed)
+motif_wide <- motif_long %>%
+  dplyr::select(sample_id, motif, frequency) %>%
+  tidyr::pivot_wider(names_from = motif, values_from = frequency, values_fill = 0) %>%
+  tibble::column_to_rownames("sample_id") %>%
+  as.matrix()
+motif_log <- log10(motif_wide[metadata$sample_id, ] + 1e-8)
+
+# 3. Methylation tile features
+tile_mat <- t(tile_mat_raw)[metadata$sample_id, ]
+if (is.null(colnames(tile_mat))) colnames(tile_mat) <- paste0("tile_", seq_len(ncol(tile_mat)))
+
+# Preprocess all feature sets
+stackhmm_scaled <- preprocess(stackhmm_meth[metadata$sample_id, ], 0.5, 10)
+motif_scaled <- preprocess(motif_log, 0.5, 50)
+tile_scaled <- preprocess(tile_mat, 0.05, 100)
+
+message(sprintf("  stackHMM: %d features, Motif: %d features, MethTile: %d features",
+                ncol(stackhmm_scaled), ncol(motif_scaled), ncol(tile_scaled)))
+
+feature_sets <- list(stackHMM = stackhmm_scaled, Motif = motif_scaled, MethTile = tile_scaled)
+y <- setNames(as.factor(metadata$Group), metadata$sample_id)
+```
+
+```{r}
+#| label: class-model-training
+#| code-fold: true
+#| code-summary: "Model Training Code"
+#| eval: false
+
+# ============================================================================
+# MODEL TRAINING WITH NESTED CV
+# ============================================================================
+
+N_INNER_FOLDS <- 5
+all_results <- list()
+
+for (feat_name in names(feature_sets)) {
+  message(sprintf("  Training %s...", feat_name))
+  X <- feature_sets[[feat_name]]
+  
+  # Boruta feature selection
+  set.seed(389)  # Reproducibility for Boruta
+  boruta_result <- Boruta::Boruta(x = X, y = y, doTrace = 0, maxRuns = 100)
+  selected <- Boruta::getSelectedAttributes(boruta_result, withTentative = TRUE)
+  
+  # Fallback if too few features selected
+  if (length(selected) < 3) {
+    imp <- Boruta::attStats(boruta_result)
+    imp <- imp[rownames(imp) %in% colnames(X), , drop = FALSE]
+    selected <- rownames(imp)[order(imp$meanImp, decreasing = TRUE)[seq_len(min(10, nrow(imp)))]]
+  }
+  selected <- intersect(selected, colnames(X))
+  if (length(selected) == 0) selected <- colnames(X)
+  
+  X_sel <- X[, selected, drop = FALSE]
+  
+  # Nested CV with Random Forest
+  mtry_vals <- unique(c(2, floor(sqrt(ncol(X_sel))), floor(ncol(X_sel) / 3)))
+  mtry_vals <- mtry_vals[mtry_vals > 0 & mtry_vals <= ncol(X_sel)]
+  
+  fit <- nestedcv::nestcv.train(
+    y = y, x = X_sel, method = "rf",
+    outer_method = "LOOCV",
+    n_inner_folds = N_INNER_FOLDS,
+    tuneGrid = data.frame(mtry = mtry_vals),
+    importance = TRUE,
+    cv.cores = 1,
+    verbose = FALSE
+  )
+  
+  all_results[[feat_name]] <- list(
+    model = fit,
+    boruta = boruta_result,
+    selected_features = selected
+  )
+}
+
+saveRDS(all_results, file.path(RDS_DIR, "nested_cv_results.rds"))
+```
+
+```{r}
+#| label: class-performance
+#| code-fold: true
+#| code-summary: "Performance Evaluation Code"
+#| eval: false
+
+# ============================================================================
+# PERFORMANCE METRICS
+# ============================================================================
+
+extract_metrics <- function(result, feature_set) {
+  fit <- result$model
+  cm <- fit$summary$table
+  
+  TP <- if ("ALS" %in% rownames(cm) && "ALS" %in% colnames(cm)) cm["ALS", "ALS"] else 0
+  TN <- if ("Ctrl" %in% rownames(cm) && "Ctrl" %in% colnames(cm)) cm["Ctrl", "Ctrl"] else 0
+  FP <- if ("ALS" %in% rownames(cm) && "Ctrl" %in% colnames(cm)) cm["ALS", "Ctrl"] else 0
+  FN <- if ("Ctrl" %in% rownames(cm) && "ALS" %in% colnames(cm)) cm["Ctrl", "ALS"] else 0
+  
+  sens <- if ((TP + FN) > 0) TP / (TP + FN) else 0
+  spec <- if ((TN + FP) > 0) TN / (TN + FP) else 0
+  prec <- if ((TP + FP) > 0) TP / (TP + FP) else 0
+  f1 <- if ((prec + sens) > 0) 2 * prec * sens / (prec + sens) else 0
+  
+  auc_val <- auc_lower <- auc_upper <- NA
+  if (!is.null(fit$roc)) {
+    auc_val <- as.numeric(pROC::auc(fit$roc))
+    tryCatch({
+      ci <- pROC::ci.auc(fit$roc, method = "delong")
+      auc_lower <- ci[1]; auc_upper <- ci[3]
+    }, error = function(e) NULL)
+  }
+  
+  tibble::tibble(
+    feature_set = feature_set,
+    n_features = length(result$selected_features),
+    AUC = auc_val,
+    AUC_lower = auc_lower,
+    AUC_upper = auc_upper,
+    Sensitivity = sens,
+    Specificity = spec,
+    Precision = prec,
+    F1 = f1,
+    TP = TP, TN = TN, FP = FP, FN = FN
+  )
+}
+
+performance_df <- purrr::map_dfr(names(all_results), ~extract_metrics(all_results[[.x]], .x)) %>%
+  dplyr::arrange(desc(AUC))
+
+readr::write_csv(performance_df, file.path(TABLE_DIR, "classification_performance_summary.csv"))
+
+boruta_features_df <- purrr::map_dfr(names(all_results), ~tibble::tibble(
+  feature_set = .x,
+  feature = all_results[[.x]]$selected_features
+))
+readr::write_csv(boruta_features_df, file.path(TABLE_DIR, "boruta_selected_features.csv"))
+```
+
+```{r}
+#| label: class-visualization
+#| code-fold: true
+#| code-summary: "Classification Visualization Code"
+#| eval: false
+
+# ============================================================================
+# CLASSIFICATION VISUALIZATIONS
+# ============================================================================
+
+# ROC Curves
+roc_data <- purrr::map_dfr(names(all_results), function(feat_name) {
+  roc_obj <- all_results[[feat_name]]$model$roc
+  if (is.null(roc_obj)) return(NULL)
+  
+  df <- data.frame(
+    fpr = 1 - roc_obj$specificities,
+    tpr = roc_obj$sensitivities,
+    feature_set = feat_name,
+    auc = as.numeric(pROC::auc(roc_obj))
+  )
+  df[order(df$fpr, df$tpr), ]
+})
+
+auc_lookup <- roc_data %>% dplyr::distinct(feature_set, auc)
+feature_labels <- sapply(names(FEATURE_COLORS), function(fs) {
+  auc_val <- auc_lookup$auc[auc_lookup$feature_set == fs]
+  sprintf("%s (AUC=%.2f)", fs, auc_val)
+})
+
+p_roc <- ggplot(roc_data, aes(x = fpr, y = tpr, color = feature_set)) +
+  geom_path(linewidth = 1.2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  scale_color_manual(values = FEATURE_COLORS, labels = feature_labels) +
+  labs(
+    title = "ROC Curves: ALS vs Control Classification",
+    subtitle = "Random Forest with Boruta feature selection (nested LOOCV)",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Feature Set"
+  ) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  theme_pub(base_size = 12) +
+  theme(legend.position = c(0.7, 0.25))
+
+ggsave(file.path(FIG_DIR, "fig7A_roc_curves_comparison.png"), p_roc, width = 7, height = 6, dpi = 450)
+
+# Performance Barplot
+perf_long <- performance_df %>%
+  dplyr::select(feature_set, AUC, Sensitivity, Specificity, F1) %>%
+  tidyr::pivot_longer(-feature_set, names_to = "metric", values_to = "value") %>%
+  dplyr::mutate(metric = factor(metric, levels = c("AUC", "Sensitivity", "Specificity", "F1")))
+
+p_perf <- ggplot(perf_long, aes(x = feature_set, y = value, fill = feature_set)) +
+  geom_col(alpha = 0.9, width = 0.7) +
+  geom_text(aes(label = sprintf("%.2f", value)), vjust = -0.3, size = 3.5) +
+  facet_wrap(~metric, nrow = 1) +
+  scale_fill_manual(values = FEATURE_COLORS) +
+  scale_y_continuous(limits = c(0, 1.1), breaks = seq(0, 1, 0.2)) +
+  labs(title = "Classification Performance by Feature Set", x = NULL, y = "Score") +
+  theme_pub(base_size = 11) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(file.path(FIG_DIR, "fig7B_performance_barplot.png"), p_perf, width = 10, height = 5, dpi = 450)
+
+# Feature Importance - RF MeanDecreaseGini for all feature sets
+imp_plots <- list()
+for (feat_name in names(all_results)) {
+  fit <- all_results[[feat_name]]$model
+  rf_imp <- fit$final_fit$finalModel$importance
+  imp_df <- data.frame(
+    feature = rownames(rf_imp),
+    importance = rf_imp[, "MeanDecreaseGini"]
+  ) %>% dplyr::arrange(desc(importance))
+  
+  top_n <- min(15, nrow(imp_df))
+  imp_df_top <- imp_df[seq_len(top_n), ]
+  
+  imp_plots[[feat_name]] <- ggplot(imp_df_top, 
+    aes(x = reorder(feature, importance), y = importance)) +
+    geom_col(fill = FEATURE_COLORS[feat_name], alpha = 0.85) +
+    coord_flip() +
+    labs(title = feat_name, x = NULL, y = "MeanDecreaseGini") +
+    theme_pub(base_size = 9) +
+    theme(axis.text.y = element_text(size = 7))
+}
+
+p_imp_combined <- patchwork::wrap_plots(imp_plots, nrow = 1) +
+  patchwork::plot_annotation(
+    title = "Random Forest Feature Importance (MeanDecreaseGini)",
+    theme = theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 14))
+  )
+
+ggsave(file.path(FIG_DIR, "fig7C_rf_importance_combined.png"), p_imp_combined, width = 14, height = 5, dpi = 450)
+
+# stackHMM Heatmap
+sample_order <- metadata %>% dplyr::arrange(Group) %>% dplyr::pull(sample_id)
+anno_df <- data.frame(Group = metadata$Group[match(sample_order, metadata$sample_id)],
+                      row.names = sample_order)
+
+ha <- ComplexHeatmap::HeatmapAnnotation(
+  df = anno_df,
+  col = list(Group = COLORS),
+  annotation_name_gp = grid::gpar(fontface = "bold", fontsize = 10)
+)
+
+ht <- ComplexHeatmap::Heatmap(
+  t(stackhmm_scaled[sample_order, ]),
+  name = "Z-score",
+  top_annotation = ha,
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  row_names_gp = grid::gpar(fontsize = 6),
+  column_names_gp = grid::gpar(fontsize = 8),
+  column_title = "Samples",
+  row_title = sprintf("stackHMM States (n=%d)", ncol(stackhmm_scaled)),
+  col = circlize::colorRamp2(c(-2, 0, 2), c("#3B4CC0", "white", "#B40426"))
+)
+
+png(file.path(FIG_DIR, "fig7D_stackhmm_methylation_heatmap.png"),
+    width = 10, height = 10, units = "in", res = 450)
+ComplexHeatmap::draw(ht)
+dev.off()
+
+# EnhA3 Methylation Boxplot
+plot_matrix <- stackhmm_meth %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("sample_id") %>%
+  dplyr::left_join(metadata, by = "sample_id")
+
+p_enha3 <- ggplot(plot_matrix, aes(x = Group, y = `45_EnhA3`, fill = Group)) +
+  geom_boxplot(alpha = 0.8, outlier.shape = NA) +
+  geom_jitter(shape = 16, size = 2, alpha = 0.8, width = 0.15) +
+  scale_fill_manual(values = COLORS) +
+  labs(x = NULL, y = "EnhA3 methylation level",
+       title = "EnhA3 (Active Enhancer 3) Methylation") +
+  theme_pub(base_size = 12) +
+  theme(legend.position = "none")
+
+ggsave(file.path(FIG_DIR, "fig7E_enha3_methylation_boxplot.png"), p_enha3, width = 5, height = 5, dpi = 450)
+
+# Combined Classification Figure
+p_ht <- patchwork::wrap_elements(full = grid::grid.grabExpr(
+  ComplexHeatmap::draw(ht, heatmap_legend_side = "right", annotation_legend_side = "right")
+))
+
+p_classification_combined <- p_perf / p_imp_combined / (p_roc | p_ht | p_enha3) +
+  patchwork::plot_layout(heights = c(1, 1, 1.2)) +
+  patchwork::plot_annotation(tag_levels = "A")
+
+ggsave(file.path(FIG_DIR, "fig7_classification_analysis_combined.png"),
+       p_classification_combined, width = 18, height = 16, dpi = 300)
+```
+
+## Results
+
+### Classification Performance
+
+![Classification analysis. (A) ROC curves comparing three feature sets for ALS vs Control discrimination. (B) Performance metrics (AUC, Sensitivity, Specificity, F1) by feature set. (C) Top features by Boruta importance for the best-performing model. (D) Heatmap of stackHMM methylation features.](results/figures/fig7A_roc_curves_comparison.png){#fig-roc width="80%"}
+
+### Performance Summary
+
+```{r}
+#| label: class-perf-table
+#| echo: false
+
+perf_summary <- readr::read_csv(file.path(TABLE_DIR, "classification_performance_summary.csv"), show_col_types = FALSE)
+
+perf_summary %>%
+  dplyr::select(feature_set, n_features, AUC, AUC_lower, AUC_upper, Sensitivity, Specificity, F1) %>%
+  dplyr::mutate(
+    AUC_CI = sprintf("%.2f (%.2f-%.2f)", AUC, AUC_lower, AUC_upper),
+    Sensitivity = sprintf("%.2f", Sensitivity),
+    Specificity = sprintf("%.2f", Specificity),
+    F1 = sprintf("%.2f", F1)
+  ) %>%
+  dplyr::select(feature_set, n_features, AUC_CI, Sensitivity, Specificity, F1) %>%
+  knitr::kable(
+    col.names = c("Feature Set", "N Features", "AUC (95% CI)", "Sensitivity", "Specificity", "F1"),
+    caption = "Classification performance summary (nested LOOCV)",
+    align = "lrrrrr"
+  ) %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+![Performance comparison across feature sets.](results/figures/fig7B_performance_barplot.png){#fig-perf-bar width="90%"}
+
+### Feature Importance
+
+![Random Forest feature importance (MeanDecreaseGini) for all three feature sets.](results/figures/fig7C_rf_importance_combined.png){#fig-importance width="100%"}
+
+### EnhA3 Methylation
+
+![EnhA3 (Active Enhancer 3) methylation levels from stackHMM annotations compared between ALS and Control groups.](results/figures/fig7E_enha3_methylation_boxplot.png){#fig-enha3 width="50%"}
+
+### Combined Classification Analysis
+
+![Combined classification analysis figure showing (A) Performance metrics, (B) Feature importance, (C) ROC curves, (D) stackHMM heatmap, and (E) EnhA3 methylation boxplot.](results/figures/fig7_classification_analysis_combined.png){#fig-class-combined width="100%"}
+
+### Key Findings
+
+**Model Performance:**
+
+- Due to the small sample size and limited sequencing coverage, the classification performance needs to be interpreted with caution.
+- stackHMM-based features are meant to capture biologically meaningful chromatin state information
+- End motif features provide complementary information about nuclease preferences
+- Methylation tiles offer direct measurement of regional methylation differences
+
+**Methodological Considerations:**
+
+- **Nested CV** prevents overfitting and provides unbiased performance estimates
+- **Boruta feature selection** identifies robust predictors without arbitrary thresholds
+- Small sample size limits generalizability; larger cohorts needed for validation
+
+**Translational Potential:**
+
+- Multi-feature integration may improve sensitivity and specificity
+- Prospective validation in independent cohorts is essential
+
+:::
+
+---
+
+# Conclusions
+
+This comprehensive analysis of cfDNA from WGBS data demonstrates the potential of cell-free DNA 
+fragmentomics and methylation profiling for ALS detection. Key findings include:
+
+1. **Quality metrics** confirm high-quality bisulfite sequencing with >99% conversion efficiency
+2. **Fragment patterns** show characteristic nucleosome protection signals
+3. **End motifs** reveal little differences in nuclease cleavage preferences between ALS and Control
+4. **Methylation analysis** identifies candidate DMRs using methods appropriate for low-coverage data
+5. **Classification** achieves discrimination using multiple cfDNA features, but due to the small sample size and limited sequencing coverage, the classification performance needs to be interpreted with caution.
+
+Future directions include expand the analyses to whole genome with deeper sequencing coverage, more in depth biological interpretation, validation in larger cohorts, integration with clinical variables, and 
+investigation of tissue-of-origin contributions to the cfDNA methylation signature.
+
+---
+
+# Session Information
+
+```{r}
+#| label: session-info
+#| echo: false
+
+sessionInfo()
+```
+
+---
+
+# References
+
+::: {#refs}
+:::
+

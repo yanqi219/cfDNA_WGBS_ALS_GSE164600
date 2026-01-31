@@ -1,0 +1,1135 @@
+---
+title: "Single-Sample cfDNA WGBS Analysis Report"
+subtitle: "Comprehensive cfDNA Fragmentomics and Methylation Analysis for ALS/Control Classification"
+author:
+  - name: "Qi Yan"
+    email: "yanqi219@gmail.com"
+date: today
+date-format: "MMMM D, YYYY"
+abstract: |
+  This report presents a comprehensive analysis of a single cell-free DNA (cfDNA) sample from 
+  whole-genome bisulfite sequencing (WGBS) data. The analysis follows the same algorithms and 
+  methods used in the ALS vs Control cohort study to ensure reproducibility and comparability.
+  Outputs include quality control metrics, insert size distributions, 5' end motif profiling,
+  and classification prediction using a pre-trained Random Forest model.
+keywords: [cfDNA, WGBS, ALS, methylation, fragmentomics, classification, MethTile, Random Forest]
+format:
+  html:
+    toc: true
+    code-fold: true
+    code-tools: true
+execute:
+  echo: true
+  warning: false
+  message: false
+params:
+  bam_file: "path/to/sample.bam"
+  bismark_cov_file: "path/to/sample.bismark.cov.gz"
+  sample_id: "Sample_001"
+  output_dir: "results"
+  project_dir: ".."
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| cache: false
+
+# Set CRAN mirror
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+knitr::opts_chunk$set(fig.align = "center", out.width = "100%", dpi = 300)
+
+# Load packages early (needed for pipe operator in dependency tables)
+suppressPackageStartupMessages({
+  library(knitr)
+  library(kableExtra)
+  library(dplyr)
+})
+```
+
+# Introduction
+
+This report presents an representative analysis of a single cell-free DNA (cfDNA) sample from whole-genome bisulfite sequencing (WGBS) data. The analysis follows the same algorithms and methods used in the ALS vs Control study to ensure reproducibility and comparability.
+
+## Analysis Overview
+
+The pipeline generates the following outputs:
+
+1. **Quality Control Metrics**: Mapping statistics, bisulfite conversion efficiency, and coverage metrics
+2. **Fragment Size Analysis**: Insert size distributions showing the characteristic cfDNA nucleosome pattern
+3. **Fragmentation Ratio Track**: Genome-wide short/long fragment ratio visualization
+4. **Genomic Distribution**: Distribution of fragment 5' start sites across genomic features
+5. **TSS Enrichment**: Nucleosome positioning signal around transcription start sites
+6. **End Motif Analysis**: 5' end 4-mer motif frequencies reflecting nuclease preferences
+7. **Classification Prediction**: Predicted group (ALS vs Ctrl) using pre-trained Random Forest model
+
+## Input Files
+
+This notebook requires two input files:
+
+- **Bismark-aligned BAM file**: Deduplicated BAM with XM methylation tags
+- **Bismark coverage file**: Output from `bismark_methylation_extractor` (`.bismark.cov.gz`)
+
+::: {.callout-note collapse="true"}
+## How to Generate Bismark Coverage File
+
+If you only have a Bismark-aligned BAM file, run the following command to extract methylation calls:
+```bash
+bismark_methylation_extractor --gzip --bedGraph \
+  --cytosine_report --genome_folder /path/to/genome \
+  your_sample.bam
+```
+
+For detailed documentation, see: [Bismark Methylation Extraction](https://felixkrueger.github.io/Bismark/bismark/methylation_extraction/)
+:::
+
+# Dependencies {#sec-dependencies}
+
+This section lists all software dependencies required to run this analysis.
+
+## R Packages
+
+### CRAN Packages
+
+```{r}
+#| label: cran-packages-table
+#| echo: false
+
+cran_deps <- data.frame(
+  Package = c("ggplot2", "dplyr", "tidyr", "readr", "purrr", "stringr", "tibble",
+              "patchwork", "here", "scales", "randomForest", "knitr", "kableExtra"),
+  Version = c(">=3.4.0", ">=1.1.0", ">=1.3.0", ">=2.1.0", ">=1.0.0", ">=1.5.0", ">=3.2.0",
+              ">=1.1.0", ">=1.0.0", ">=1.2.0", ">=4.7", ">=1.40", ">=1.3.0"),
+  Purpose = c("Data visualization", "Data manipulation", "Data tidying", "File I/O",
+              "Functional programming", "String manipulation", "Modern data frames",
+              "Plot composition", "Project-relative paths", "Axis formatting",
+              "Classification model", "Report generation", "Table formatting")
+)
+
+knitr::kable(cran_deps, caption = "Required CRAN packages") %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+```
+
+### Bioconductor Packages
+
+```{r}
+#| label: bioc-packages-table
+#| echo: false
+
+bioc_deps <- data.frame(
+  Package = c("Rsamtools", "cigarillo", "GenomicRanges", "IRanges", "S4Vectors", "Biostrings",
+              "BSgenome.Hsapiens.UCSC.hg38", "GenomeInfoDb", "TxDb.Hsapiens.UCSC.hg38.knownGene",
+              "GenomicFeatures", "ChIPseeker", "org.Hs.eg.db", "AnnotationDbi",
+              "bsseq", "Gviz"),
+  Version = c(">=2.14.0", ">=1.0.0", ">=1.50.0", ">=2.32.0", ">=0.36.0", ">=2.66.0",
+              ">=1.4.0", ">=1.34.0", ">=3.16.0", ">=1.50.0", ">=1.34.0",
+              ">=3.16.0", ">=1.60.0", ">=1.34.0", ">=1.42.0"),
+  Purpose = c("BAM file handling", "CIGAR string parsing", "Genomic intervals", "Integer ranges",
+              "S4 vector infrastructure", "DNA sequence handling", "Human reference genome (hg38)",
+              "Genome metadata", "Gene annotations (hg38)", "Genomic features", "Peak annotation",
+              "Human gene IDs", "Annotation infrastructure", "Bisulfite-seq analysis",
+              "Genomic track visualization")
+)
+
+knitr::kable(bioc_deps, caption = "Required Bioconductor packages") %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+```
+
+## External Tools
+
+```{r}
+#| label: tools-table
+#| echo: false
+
+tools_deps <- data.frame(
+  Tool = c("Bismark", "samtools", "Quarto"),
+  Version = c(">=0.24.0", ">=1.17", ">=1.3.0"),
+  Purpose = c("Bisulfite read alignment & methylation extraction",
+              "BAM file manipulation (indexing)",
+              "Document rendering"),
+  Link = c("[GitHub](https://github.com/FelixKrueger/Bismark)",
+           "[GitHub](https://github.com/samtools/samtools)",
+           "[quarto.org](https://quarto.org)")
+)
+
+knitr::kable(tools_deps, caption = "Required external tools") %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+```
+
+::: {.callout-tip collapse="true"}
+## Installation Commands
+
+```r
+# CRAN packages
+install.packages(c("ggplot2", "dplyr", "tidyr", "readr", "purrr", 
+                   "stringr", "tibble", "patchwork", "here", "scales",
+                   "randomForest", "knitr", "kableExtra"))
+
+# Bioconductor packages
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install(c(
+  "Rsamtools", "cigarillo", "GenomicRanges", "IRanges", "S4Vectors",
+  "Biostrings", "BSgenome.Hsapiens.UCSC.hg38", "GenomeInfoDb",
+  "TxDb.Hsapiens.UCSC.hg38.knownGene", "GenomicFeatures",
+  "ChIPseeker", "org.Hs.eg.db", "AnnotationDbi",
+  "bsseq", "Gviz"
+))
+```
+:::
+
+# Setup and Input Validation {#sec-setup}
+
+```{r}
+#| label: load-packages
+#| message: false
+
+# Load required packages
+suppressPackageStartupMessages({
+  # CRAN packages
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(purrr)
+  library(stringr)
+  library(tibble)
+  library(patchwork)
+  library(here)
+  library(knitr)
+  library(kableExtra)
+  library(scales)
+  library(randomForest)
+  
+  # Bioconductor packages
+  library(Rsamtools)
+  library(cigarillo)
+  library(GenomicRanges)
+  library(IRanges)
+  library(S4Vectors)
+  library(Biostrings)
+  library(BSgenome.Hsapiens.UCSC.hg38)
+  library(GenomeInfoDb)
+  library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+  library(GenomicFeatures)
+  library(ChIPseeker)
+  library(org.Hs.eg.db)
+  library(AnnotationDbi)
+  library(bsseq)
+  library(Gviz)
+})
+
+# Load analysis functions (from same directory as this notebook)
+# The functions file should be in the same directory as this .qmd file
+source("cfDNA_analysis_functions.R")
+
+# Set seed for reproducibility
+set.seed(389)
+```
+
+```{r}
+#| label: setup-paths
+
+# Parameters from YAML
+BAM_FILE <- params$bam_file
+BISMARK_COV_FILE <- params$bismark_cov_file
+SAMPLE_ID <- params$sample_id
+OUTPUT_DIR <- params$output_dir
+PROJECT_DIR <- params$project_dir
+
+# Create output directory
+if (!dir.exists(OUTPUT_DIR)) {
+  dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+}
+
+# Temporary directory for intermediate files
+TEMP_DIR <- file.path(OUTPUT_DIR, "temp")
+if (!dir.exists(TEMP_DIR)) {
+  dir.create(TEMP_DIR, recursive = TRUE, showWarnings = FALSE)
+}
+
+# Load reference data
+genome <- BSgenome.Hsapiens.UCSC.hg38
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+# Path to pre-trained model and data files (local to this notebook)
+# These files are copied from the main analysis to ensure standalone operation
+DATA_RDS_DIR <- "data/rds"
+MODEL_PATH <- file.path(DATA_RDS_DIR, "nested_cv_results.rds")
+TILE_SCALED_PATH <- file.path(DATA_RDS_DIR, "tile_scaled_matrix.rds")
+SCALING_PARAMS_PATH <- file.path(DATA_RDS_DIR, "meththile_scaling_params.rds")
+```
+
+```{r}
+#| label: validate-inputs
+
+# Validate input files
+validation_results <- tibble::tibble(
+  File = c("BAM file", "Bismark coverage file", "Pre-trained model", 
+           "Tile scaled matrix", "Scaling parameters"),
+  Path = c(BAM_FILE, BISMARK_COV_FILE, MODEL_PATH, TILE_SCALED_PATH, SCALING_PARAMS_PATH),
+  Exists = c(file.exists(BAM_FILE), file.exists(BISMARK_COV_FILE), file.exists(MODEL_PATH),
+             file.exists(TILE_SCALED_PATH), file.exists(SCALING_PARAMS_PATH))
+)
+
+knitr::kable(validation_results, caption = "Input file validation") %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  kableExtra::row_spec(which(!validation_results$Exists), bold = TRUE, color = "white", background = "#E64B35")
+
+# Stop if required files are missing
+required_files <- c(BAM_FILE, BISMARK_COV_FILE)
+missing_required <- required_files[!file.exists(required_files)]
+if (length(missing_required) > 0) {
+  stop("Missing required input files:\n", paste("  -", missing_required, collapse = "\n"))
+}
+```
+
+# QC Metrics {#sec-qc}
+
+This section extracts quality control metrics from the BAM file, including mapping statistics, fragment size distribution, and methylation metrics.
+
+```{r}
+#| label: extract-bam-metrics
+#| cache: true
+
+# Extract BAM metrics (this generates the fragment BED file as well)
+message("Extracting BAM metrics...")
+metrics <- extract_bam_metrics(
+  bam_path = BAM_FILE,
+  sample_id = SAMPLE_ID,
+  genome = genome,
+  chunk_size = 1e6,
+  frag_dir = TEMP_DIR
+)
+
+# Calculate summary statistics
+summary_stats <- calculate_summary_stats(metrics)
+```
+
+```{r}
+#| label: qc-metrics-table
+
+# Format key metrics for display
+qc_display <- tibble::tibble(
+  Metric = c(
+    "Total Reads",
+    "Mapped Reads",
+    "Mapping Rate",
+    "Properly Paired",
+    "Proper Pair Rate",
+    "Duplicates",
+    "Duplicate Rate",
+    "Filtered Reads (MAPQ≥30)",
+    "Filter Pass Rate",
+    "Mean MAPQ",
+    "Number of Fragments",
+    "Mean Fragment Length",
+    "Median Fragment Length",
+    "Mode Fragment Length",
+    "GC Content",
+    "CpG Methylation",
+    "Bisulfite Conversion"
+  ),
+  Value = c(
+    format(summary_stats$total_reads, big.mark = ","),
+    format(summary_stats$mapped_reads, big.mark = ","),
+    sprintf("%.2f%%", summary_stats$mapping_rate * 100),
+    format(summary_stats$properly_paired, big.mark = ","),
+    sprintf("%.2f%%", summary_stats$proper_pair_rate * 100),
+    format(summary_stats$duplicates, big.mark = ","),
+    sprintf("%.2f%%", summary_stats$duplicate_rate * 100),
+    format(summary_stats$filtered_reads, big.mark = ","),
+    sprintf("%.2f%%", summary_stats$filter_pass_rate * 100),
+    sprintf("%.1f", summary_stats$mean_mapq),
+    format(summary_stats$n_fragments, big.mark = ","),
+    sprintf("%.1f bp", summary_stats$mean_frag_length),
+    sprintf("%.0f bp", summary_stats$median_frag_length),
+    sprintf("%.0f bp", summary_stats$frag_mode),
+    sprintf("%.2f%%", summary_stats$gc_content * 100),
+    sprintf("%.2f%%", summary_stats$cpg_methylation * 100),
+    sprintf("%.2f%%", summary_stats$bisulfite_conversion * 100)
+  )
+)
+
+knitr::kable(qc_display, caption = paste("QC Summary for", SAMPLE_ID)) %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  kableExtra::pack_rows("Alignment Statistics", 1, 9) %>%
+  kableExtra::pack_rows("Fragment Statistics", 10, 14) %>%
+  kableExtra::pack_rows("Methylation Statistics", 15, 17)
+```
+
+## QC Metrics Visualization {#sec-qc-viz}
+
+```{r}
+#| label: fig-qc-barplot
+#| fig-cap: "Key QC metrics for the sample"
+#| fig-height: 6
+#| fig-width: 10
+
+# Prepare data for bar chart
+qc_plot_data <- tibble::tibble(
+  metric = c("Total Reads (M)", "Filtered Reads (M)", "Mean MAPQ", 
+             "Median Fragment (bp)", "GC Content (%)", 
+             "CpG Methylation (%)", "Bisulfite Conv. (%)"),
+  value = c(
+    summary_stats$total_reads / 1e6,
+    summary_stats$filtered_reads / 1e6,
+    summary_stats$mean_mapq,
+    summary_stats$median_frag_length,
+    summary_stats$gc_content * 100,
+    summary_stats$cpg_methylation * 100,
+    summary_stats$bisulfite_conversion * 100
+  ),
+  category = c("Reads", "Reads", "Quality", "Fragment", "Fragment", "Methylation", "Methylation")
+) %>%
+  dplyr::mutate(
+    metric = factor(metric, levels = rev(metric)),
+    label = dplyr::case_when(
+      grepl("Reads", metric) ~ sprintf("%.1fM", value),
+      grepl("MAPQ", metric) ~ sprintf("%.1f", value),
+      grepl("Fragment", metric) & !grepl("%", metric) ~ sprintf("%.0f bp", value),
+      TRUE ~ sprintf("%.1f%%", value)
+    )
+  )
+
+# Create horizontal bar chart
+p_qc <- ggplot(qc_plot_data, aes(x = value, y = metric, fill = category)) +
+  geom_col(width = 0.7, alpha = 0.9) +
+  geom_text(aes(label = label), hjust = -0.1, size = 3.5, fontface = "bold") +
+  scale_fill_brewer(palette = "Set2") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.25))) +
+  labs(
+    title = paste("QC Metrics:", SAMPLE_ID),
+    subtitle = "Key quality indicators from BAM file analysis",
+    x = "Value",
+    y = NULL,
+    fill = "Category"
+  ) +
+  theme_pub(base_size = 12) +
+  theme(
+    legend.position = "top",
+    panel.grid.major.y = element_blank()
+  )
+
+p_qc
+```
+
+# Fragmentation Analysis {#sec-fragmentation}
+
+Cell-free DNA exhibits characteristic insert size patterns reflecting nucleosome protection. This section analyzes the insert size distribution and genome-wide short/long fragment ratio.
+
+## Insert Size Distribution {#sec-insert-size}
+
+```{r}
+#| label: fig-sawtooth
+#| fig-cap: "Fragment size distribution showing characteristic cfDNA nucleosome pattern"
+#| fig-height: 5
+#| fig-width: 10
+
+# Prepare fragment length data
+frag_df <- tibble::tibble(
+  fragment_length = metrics$fragment_lengths
+) %>%
+  dplyr::filter(fragment_length >= 80, fragment_length <= 450)
+
+# Count fragments by length
+counts_saw <- frag_df %>%
+  dplyr::count(fragment_length, name = "n")
+
+# Calculate mode for annotation
+calc_mode <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) return(NA_integer_)
+  x <- as.integer(x)
+  tabulate(x, nbins = max(x)) |> which.max()
+}
+
+mode_bp <- calc_mode(metrics$fragment_lengths)
+median_bp <- median(metrics$fragment_lengths, na.rm = TRUE)
+short_n <- sum(metrics$fragment_lengths >= 100 & metrics$fragment_lengths <= 150)
+long_n <- sum(metrics$fragment_lengths >= 151 & metrics$fragment_lengths <= 220)
+short_long_ratio <- if (long_n > 0) short_n / long_n else NA
+
+# Create sawtooth plot
+p_sawtooth <- ggplot(counts_saw, aes(x = fragment_length, y = n)) +
+  geom_line(linewidth = 0.5, color = "gray20") +
+  geom_vline(xintercept = 167, linetype = "dashed", color = "#E64B35", linewidth = 0.6) +
+  geom_vline(xintercept = 334, linetype = "dashed", color = "#4DBBD5", linewidth = 0.6) +
+  annotate("text", x = 175, y = max(counts_saw$n) * 0.95, 
+           label = "Mono-nucleosome\n(~167 bp)", hjust = 0, size = 3, color = "#E64B35") +
+  annotate("text", x = 342, y = max(counts_saw$n) * 0.5, 
+           label = "Di-nucleosome\n(~334 bp)", hjust = 0, size = 3, color = "#4DBBD5") +
+  annotate("label", x = 380, y = max(counts_saw$n) * 0.85,
+           label = sprintf("Median: %d bp\nMode: %d bp\nS/L ratio: %.3f", 
+                          as.integer(median_bp), mode_bp, short_long_ratio),
+           hjust = 0, size = 3, fill = "white", label.size = 0.3) +
+  labs(
+    title = "cfDNA Fragment Size Distribution",
+    subtitle = paste("Sample:", SAMPLE_ID),
+    x = "Fragment Length (bp)",
+    y = "Count"
+  ) +
+  theme_pub(base_size = 12)
+
+p_sawtooth
+```
+
+## Fragmentation Ratio Track {#sec-frag-ratio}
+
+The short/long fragment ratio varies across the genome and can reveal nucleosome positioning differences.
+
+```{r}
+#| label: compute-frag-ratio
+#| cache: true
+
+# Set up genomic bins (chr21 only for efficiency)
+bin_size <- 2e6
+chroms <- "chr21"
+seqlens <- GenomeInfoDb::seqlengths(genome)[chroms]
+seqlens <- seqlens[!is.na(seqlens)]
+
+bins_gr <- GenomicRanges::tileGenome(
+  seqlengths = seqlens,
+  tilewidth = bin_size,
+  cut.last.tile.in.chrom = TRUE
+)
+
+bins_df <- tibble::tibble(
+  bin_id = seq_along(bins_gr),
+  chrom = as.character(GenomeInfoDb::seqnames(bins_gr)),
+  start = start(bins_gr),
+  end = end(bins_gr),
+  mid = as.integer(floor((start + end) / 2))
+)
+
+# GC content per bin
+bin_seqs <- Biostrings::getSeq(genome, bins_gr)
+freq <- Biostrings::letterFrequency(bin_seqs, letters = c("A", "C", "G", "T", "N"), as.prob = FALSE)
+acgt <- rowSums(freq[, c("A", "C", "G", "T"), drop = FALSE])
+gc <- (freq[, "G"] + freq[, "C"]) / pmax(acgt, 1)
+n_frac <- freq[, "N"] / Biostrings::width(bin_seqs)
+
+bins_df <- bins_df %>%
+  dplyr::mutate(gc = as.numeric(gc), n_frac = as.numeric(n_frac))
+
+# GC filtering thresholds
+gc_min <- 0.10
+gc_max <- 0.85
+n_frac_max <- 0.45
+bins_keep_for_gc <- is.finite(bins_df$gc) &
+  bins_df$gc >= gc_min & bins_df$gc <= gc_max &
+  is.finite(bins_df$n_frac) & bins_df$n_frac <= n_frac_max
+
+# Compute bin counts
+fragment_bed_path <- file.path(TEMP_DIR, paste0(SAMPLE_ID, ".fragments.bed.gz"))
+bin_tracks <- bin_counts_one_sample(
+  path = fragment_bed_path,
+  bins_gr = bins_gr,
+  bins_df = bins_df,
+  bins_keep_for_gc = bins_keep_for_gc
+)
+
+bin_tracks <- bin_tracks %>%
+  dplyr::left_join(bins_df, by = "bin_id")
+```
+
+```{r}
+#| label: fig-frag-ratio-track
+#| fig-cap: "Genome-wide fragmentation ratio track (GC-corrected short/long ratio)"
+#| fig-height: 4
+#| fig-width: 12
+
+# Plot fragmentation ratio track
+p_frag_track <- ggplot(bin_tracks, aes(x = mid / 1e6, y = short_long_ratio)) +
+  geom_hline(yintercept = 1, color = "gray70", linewidth = 0.35) +
+  geom_line(linewidth = 0.8, color = "#2E4A62") +
+  geom_point(size = 1.5, color = "#2E4A62", alpha = 0.7) +
+  scale_x_continuous(breaks = seq(0, 50, by = 10)) +
+  labs(
+    title = paste("Fragmentation Ratio Track:", SAMPLE_ID),
+    subtitle = sprintf("GC-corrected short(90-150bp)/long(151-220bp) ratio in %d Mb bins on chr21", 
+                      bin_size / 1e6),
+    x = "Genomic Position (Mb)",
+    y = "Short/Long Ratio"
+  ) +
+  theme_pub(base_size = 12)
+
+p_frag_track
+```
+
+```{r}
+#| label: fig-frag-ratio-gviz
+#| fig-cap: "Chromosome-style fragmentation ratio visualization"
+#| fig-height: 4
+#| fig-width: 14
+#| eval: true
+
+# Gviz visualization
+if (requireNamespace("Gviz", quietly = TRUE)) {
+  genome_build <- "hg38"
+  chrom <- "chr21"
+  from_bp <- min(bins_df$start, na.rm = TRUE)
+  to_bp <- max(bins_df$end, na.rm = TRUE)
+  
+  gr_bins <- GenomicRanges::GRanges(
+    seqnames = bins_df$chrom,
+    ranges = IRanges::IRanges(start = bins_df$start, end = bins_df$end)
+  )
+  
+  y <- bin_tracks$short_long_ratio
+  y_lim <- range(y[is.finite(y)], na.rm = TRUE)
+  y_pad <- 0.15 * diff(y_lim)
+  y_lim <- c(y_lim[1] - y_pad, y_lim[2] + y_pad)
+  
+  axis_track <- Gviz::GenomeAxisTrack(genome = genome_build, chromosome = chrom, name = "")
+  
+  ratio_track <- Gviz::DataTrack(
+    range = gr_bins,
+    data = y,
+    genome = genome_build,
+    chromosome = chrom,
+    name = "S/L ratio",
+    type = "l",
+    col = "#2E4A62",
+    lwd = 2,
+    ylim = y_lim,
+    baseline = 1,
+    col.baseline = "gray45",
+    lty.baseline = 2,
+    lwd.baseline = 1,
+    cex.axis = 0.9,
+    cex.title = 0.9
+  )
+  
+  ideo_track <- tryCatch(
+    Gviz::IdeogramTrack(genome = genome_build, chromosome = chrom),
+    error = function(e) NULL
+  )
+  
+  tracks <- list(axis_track, ratio_track)
+  if (!is.null(ideo_track)) tracks <- c(list(ideo_track), tracks)
+  
+  Gviz::plotTracks(
+    tracks,
+    from = from_bp,
+    to = to_bp,
+    background.title = "white",
+    col.title = "black",
+    cex.title = 0.95,
+    background.panel = "white",
+    col.axis = "black",
+    col.frame = "gray85"
+  )
+}
+```
+
+# Fragment Start Site Analysis {#sec-fragment-starts}
+
+This section analyzes the genomic distribution of fragment 5' start sites and their enrichment around transcription start sites.
+
+## Genomic Distribution {#sec-genomic-dist}
+
+```{r}
+#| label: annotate-fragment-starts
+#| cache: true
+
+# Annotate fragment 5' starts
+start_annot <- annotate_fragment_starts_one_sample(
+  fragment_bed_gz = fragment_bed_path,
+  sample_id = SAMPLE_ID,
+  txdb = txdb
+)
+```
+
+```{r}
+#| label: fig-genomic-distribution
+#| fig-cap: "Genomic distribution of fragment 5' start sites"
+#| fig-height: 6
+#| fig-width: 8
+
+# Prepare data for donut chart
+annot_data <- start_annot %>%
+  tidyr::pivot_longer(
+    cols = c(Promoter, Exon, Intron, Three_UTR, Five_UTR, Distal_Intergenic, Downstream),
+    names_to = "annotation",
+    values_to = "n"
+  ) %>%
+  dplyr::mutate(
+    pct = 100 * n / sum(n),
+    annotation = dplyr::case_when(
+      annotation == "Three_UTR" ~ "3' UTR",
+      annotation == "Five_UTR" ~ "5' UTR",
+      annotation == "Distal_Intergenic" ~ "Distal Intergenic",
+      TRUE ~ annotation
+    ),
+    annotation = factor(annotation, levels = c("Promoter", "5' UTR", "Exon", "Intron", 
+                                               "3' UTR", "Downstream", "Distal Intergenic"))
+  ) %>%
+  dplyr::arrange(annotation) %>%
+  dplyr::mutate(
+    ymax = cumsum(pct),
+    ymin = dplyr::lag(ymax, default = 0),
+    label_pos = (ymin + ymax) / 2,
+    label = sprintf("%s\n%.1f%%", annotation, pct)
+  )
+
+# Create donut chart
+p_donut <- ggplot(annot_data, aes(ymax = ymax, ymin = ymin, xmax = 4, xmin = 2.5, fill = annotation)) +
+  geom_rect(color = "white", linewidth = 0.5) +
+  geom_text(aes(x = 3.25, y = label_pos, label = sprintf("%.1f%%", pct)), 
+            size = 3, color = "white", fontface = "bold") +
+  coord_polar(theta = "y") +
+  xlim(c(1, 4)) +
+  scale_fill_brewer(palette = "Set2") +
+  annotate("text", x = 1, y = 0, label = paste("Total\n", format(start_annot$total_starts, big.mark = ",")),
+           size = 4, fontface = "bold") +
+  labs(
+    title = "Genomic Distribution of Fragment 5' Starts",
+    subtitle = paste("Sample:", SAMPLE_ID),
+    fill = "Annotation"
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "right"
+  )
+
+p_donut
+```
+
+## TSS Enrichment {#sec-tss-enrichment}
+
+```{r}
+#| label: compute-tss-enrichment
+#| cache: true
+
+# Get muscle-related genes on chr21
+muscle_symbols <- c("COL6A1", "COL6A2")
+muscle_map <- AnnotationDbi::select(
+  org.Hs.eg.db::org.Hs.eg.db,
+  keys = muscle_symbols,
+  keytype = "SYMBOL",
+  columns = c("SYMBOL", "ENTREZID")
+) %>%
+  dplyr::filter(!is.na(.data$ENTREZID)) %>%
+  dplyr::mutate(ENTREZID = as.character(.data$ENTREZID))
+
+genes_chr21 <- suppressMessages(GenomicFeatures::genes(txdb))
+genes_chr21 <- genes_chr21[as.character(GenomeInfoDb::seqnames(genes_chr21)) == "chr21"]
+genes_muscle <- genes_chr21[as.character(genes_chr21$gene_id) %in% unique(muscle_map$ENTREZID)]
+
+# TSS windows for muscle genes
+tss_points_m <- unique(GenomicRanges::promoters(genes_muscle, upstream = 0L, downstream = 1L))
+tss_windows_m <- unique(GenomicRanges::promoters(genes_muscle, upstream = 2000L, downstream = 2000L))
+tss_site_m <- start(tss_points_m)
+tss_strand_m <- as.character(strand(tss_points_m))
+
+# Compute TSS enrichment profile
+tss_profile <- profile_tss_enrichment_starts(
+  fragment_bed_gz = fragment_bed_path,
+  tss_windows = tss_windows_m,
+  tss_site = tss_site_m,
+  tss_strand = tss_strand_m,
+  flank = 2000L
+)
+```
+
+```{r}
+#| label: fig-tss-enrichment
+#| fig-cap: "TSS enrichment of fragment 5' start sites around muscle genes on chr21"
+#| fig-height: 5
+#| fig-width: 10
+
+# Smooth the profile
+tss_profile_smooth <- tss_profile %>%
+  dplyr::mutate(
+    enrichment_smooth = moving_average(enrichment, k = 21),
+    enrichment_smooth = dplyr::if_else(is.na(enrichment_smooth), enrichment, enrichment_smooth)
+  )
+
+p_tss <- ggplot(tss_profile_smooth, aes(x = rel_bp, y = enrichment_smooth)) +
+  geom_hline(yintercept = 1, color = "gray60", linewidth = 0.35) +
+  geom_vline(xintercept = 0, color = "gray30", linewidth = 0.5) +
+  geom_line(linewidth = 0.9, color = "#2E4A62") +
+  annotate("text", x = 50, y = max(tss_profile_smooth$enrichment_smooth, na.rm = TRUE) * 0.95,
+           label = "TSS", hjust = 0, size = 4, fontface = "bold") +
+  labs(
+    title = "TSS Enrichment of Fragment 5' Start Sites",
+    subtitle = paste("Muscle genes (COL6A1, COL6A2) on chr21 | Sample:", SAMPLE_ID),
+    x = "Distance to TSS (bp)",
+    y = "Normalized Fragment Density"
+  ) +
+  theme_pub(base_size = 12)
+
+p_tss
+```
+
+# End Motif Analysis {#sec-end-motifs}
+
+Cell-free DNA fragments exhibit characteristic 5' end motif patterns reflecting the sequence preferences of nucleases involved in cfDNA generation.
+
+```{r}
+#| label: extract-end-motifs
+#| cache: true
+
+# Extract 4-mer end motifs
+motifs_all <- all_4mers()
+valid_seqnames <- seqnames(genome)
+
+motif_counts <- extract_4mer_counts_from_frag_bed(
+  frag_bed_gz = fragment_bed_path,
+  sample_id = SAMPLE_ID,
+  genome = genome,
+  valid_seqnames = valid_seqnames,
+  motifs_all = motifs_all
+)
+
+# Calculate frequencies
+motif_freq <- motif_counts %>%
+  dplyr::mutate(
+    total = sum(count),
+    frequency = count / total
+  )
+```
+
+## Top 20 End Motifs {#sec-top-motifs}
+
+```{r}
+#| label: fig-top20-motifs
+#| fig-cap: "Top 20 cfDNA 5' end motifs (4-mer)"
+#| fig-height: 6
+#| fig-width: 8
+
+# Get top 20 motifs
+top20_motifs <- motif_freq %>%
+  dplyr::arrange(desc(frequency)) %>%
+  dplyr::slice_head(n = 20) %>%
+  dplyr::mutate(motif = factor(motif, levels = rev(motif)))
+
+p_top20 <- ggplot(top20_motifs, aes(x = frequency, y = motif)) +
+  geom_col(fill = "#3C5488", alpha = 0.9, width = 0.7) +
+  geom_text(aes(label = sprintf("%.4f", frequency)), hjust = -0.1, size = 3) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title = "Top 20 cfDNA 5' End Motifs (4-mer)",
+    subtitle = paste("Sample:", SAMPLE_ID),
+    x = "Frequency",
+    y = "Motif"
+  ) +
+  theme_pub(base_size = 12) +
+  theme(panel.grid.major.y = element_blank())
+
+p_top20
+```
+## Motif Diversity Score {#sec-mds}
+
+The Motif Diversity Score (MDS) is calculated as the normalized Shannon entropy of the 256 4-mer frequencies.
+
+```{r}
+#| label: compute-mds
+
+# Calculate MDS
+freq_vec <- motif_freq$frequency
+entropy_bits <- shannon_entropy_bits(freq_vec)
+max_entropy <- log2(256)  # Maximum possible entropy for 256 motifs
+mds <- entropy_bits / max_entropy
+
+mds_display <- tibble::tibble(
+  Metric = c("Shannon Entropy (bits)", "Maximum Entropy (bits)", "Motif Diversity Score (MDS)"),
+  Value = c(sprintf("%.4f", entropy_bits), sprintf("%.4f", max_entropy), sprintf("%.4f", mds))
+)
+
+knitr::kable(mds_display, caption = "End Motif Diversity Metrics") %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r}
+#| label: fig-mds-gauge
+#| fig-cap: "Motif Diversity Score (MDS) - Normalized Shannon entropy of 256 4-mer frequencies"
+#| fig-height: 3
+#| fig-width: 6
+
+# Create a simple gauge-like visualization for MDS
+p_mds <- ggplot() +
+  geom_rect(aes(xmin = 0, xmax = 1, ymin = 0, ymax = 1), fill = "gray90") +
+  geom_rect(aes(xmin = 0, xmax = mds, ymin = 0, ymax = 1), fill = "#3C5488", alpha = 0.8) +
+  geom_text(aes(x = 0.5, y = 0.5, label = sprintf("MDS = %.4f", mds)), 
+            size = 8, fontface = "bold", color = "white") +
+  geom_text(aes(x = 0.5, y = -0.3, label = "Shannon entropy of 256 4-mer frequencies (normalized)"),
+            size = 3.5, color = "gray40") +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) +
+  scale_y_continuous(limits = c(-0.5, 1.2)) +
+  labs(title = paste("Motif Diversity Score:", SAMPLE_ID)) +
+  theme_void(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 14, margin = ggplot2::margin(b = 10)),
+    axis.text.x = element_text(color = "gray30"),
+    axis.ticks.x = element_line(color = "gray30")
+  )
+
+p_mds
+```
+
+# Classification Prediction {#sec-classification}
+
+This section uses the pre-trained Random Forest model to predict whether the sample belongs to the ALS or Control group based on MethTile (1 kb genomic tiles) methylation features.
+
+```{r}
+#| label: load-model-and-predict
+#| cache: false
+
+# Check if all model files exist
+model_available <- file.exists(MODEL_PATH) && 
+                   file.exists(TILE_SCALED_PATH) && 
+                   file.exists(SCALING_PARAMS_PATH)
+
+if (model_available) {
+  # Load pre-trained model and saved data
+  all_results <- readRDS(MODEL_PATH)
+  tile_scaled <- readRDS(TILE_SCALED_PATH)
+  scaling_params <- readRDS(SCALING_PARAMS_PATH)
+  
+  # Get model result and selected features
+  model_result <- all_results[["MethTile"]]
+  selected_features <- model_result$selected_features
+  
+  # Check if sample is in the training set
+  sample_in_training <- SAMPLE_ID %in% rownames(tile_scaled)
+  
+  if (sample_in_training) {
+    # Use EXACT values from training (ensures perfect consistency)
+    message(sprintf("Sample %s found in training set. Using exact scaled values.", SAMPLE_ID))
+    new_features <- tile_scaled[SAMPLE_ID, selected_features, drop = FALSE]
+  } else {
+    # For samples NOT in training set, compute features and apply saved scaling
+    message(sprintf("Sample %s not in training set. Computing features from bismark coverage file.", SAMPLE_ID))
+    
+    # Load methylation data from bismark coverage file
+    bs <- bsseq::read.bismark(
+      files = BISMARK_COV_FILE,
+      rmZeroCov = TRUE,
+      strandCollapse = TRUE,
+      verbose = FALSE
+    )
+    
+    # Generate 1kb tiles on chr21 (same as training)
+    tile_gr <- GenomicRanges::tileGenome(
+      seqlengths = GenomeInfoDb::seqlengths(genome)["chr21"],
+      tilewidth = 1000,
+      cut.last.tile.in.chrom = TRUE
+    )
+    
+    # Calculate mean methylation per tile
+    meth_by_tile <- bsseq::getMeth(bs, regions = tile_gr, type = "raw", what = "perRegion")
+    
+    # Create tile names (same format as training: chr21_start_end)
+    tile_names <- sprintf("%s_%d_%d", 
+                          as.character(GenomicRanges::seqnames(tile_gr)),
+                          GenomicRanges::start(tile_gr), 
+                          GenomicRanges::end(tile_gr))
+    
+    # Convert to named vector (percent methylation, same as training)
+    tile_meth <- setNames(as.numeric(meth_by_tile[, 1]) * 100, tile_names)
+    
+    # Get raw values for selected features
+    new_features_raw <- tile_meth[selected_features]
+    
+    # Get scaling parameters for selected features
+    feature_centers <- scaling_params$center[selected_features]
+    feature_scales <- scaling_params$scale[selected_features]
+    
+    # Impute missing values with 0 (center value after scaling)
+    # This is consistent with training where missing values result in 0 after imputation + scaling
+    new_features_raw[is.na(new_features_raw)] <- feature_centers[is.na(new_features_raw)]
+    
+    # Apply z-score scaling using exact training parameters
+    new_features_scaled <- (new_features_raw - feature_centers) / feature_scales
+    new_features_scaled[is.nan(new_features_scaled)] <- 0
+    
+    # Create matrix for prediction
+    new_features <- matrix(new_features_scaled, nrow = 1,
+                           dimnames = list(SAMPLE_ID, selected_features))
+  }
+  
+  # Make prediction using the model
+  prediction <- predict_single_sample(new_features, model_result)
+  
+  # Store for reporting
+  prediction_available <- TRUE
+  prediction_source <- if (sample_in_training) "training_set" else "computed"
+  
+} else {
+  prediction_available <- FALSE
+  missing_files <- c()
+  if (!file.exists(MODEL_PATH)) missing_files <- c(missing_files, "Pre-trained model")
+  if (!file.exists(TILE_SCALED_PATH)) missing_files <- c(missing_files, "Tile scaled matrix")
+  if (!file.exists(SCALING_PARAMS_PATH)) missing_files <- c(missing_files, "Scaling parameters")
+  message("Missing files for classification: ", paste(missing_files, collapse = ", "))
+}
+```
+
+```{r}
+#| label: display-prediction
+#| eval: !expr prediction_available
+
+if (prediction_available) {
+  # Display prediction results
+  pred_class <- prediction$predicted_class
+  pred_prob <- prediction$probabilities
+  
+  pred_color <- if (pred_class == "ALS") "#E64B35" else "#4DBBD5"
+  
+  # Show feature source
+  source_msg <- if (prediction_source == "training_set") {
+    "Features extracted from training set (exact match)"
+  } else {
+    "Features computed from bismark coverage file"
+  }
+  message("Feature source: ", source_msg)
+}
+```
+
+```{r}
+#| label: fig-prediction
+#| fig-cap: "Classification prediction result"
+#| fig-height: 4
+#| fig-width: 8
+#| eval: !expr prediction_available
+
+if (prediction_available) {
+  # Create prediction visualization
+  prob_data <- tibble::tibble(
+    Group = c("Ctrl", "ALS"),
+    Probability = c(pred_prob$Ctrl, pred_prob$ALS)
+  ) %>%
+    dplyr::mutate(Group = factor(Group, levels = c("Ctrl", "ALS")))
+  
+  # Create label for binary prediction
+  confidence <- max(pred_prob$Ctrl, pred_prob$ALS) * 100
+  prediction_label <- sprintf("Prediction: %s (%.1f%% confidence)", pred_class, confidence)
+  
+  p_pred <- ggplot(prob_data, aes(x = Group, y = Probability, fill = Group)) +
+    geom_col(width = 0.6, alpha = 0.9) +
+    geom_text(aes(label = sprintf("%.1f%%", Probability * 100)), 
+              vjust = -0.5, size = 5, fontface = "bold") +
+    geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray50") +
+    annotate("label", x = 1.5, y = 0.95, label = prediction_label,
+             size = 5, fontface = "bold", fill = pred_color, color = "white",
+             label.padding = unit(0.5, "lines"), label.r = unit(0.3, "lines")) +
+    scale_fill_manual(values = COLORS) +
+    scale_y_continuous(limits = c(0, 1.15), labels = scales::percent) +
+    labs(
+      title = "Classification Prediction Result",
+      subtitle = paste("Sample:", SAMPLE_ID, "| Model: MethTile (1kb) | Features:", 
+                       length(selected_features), "tiles"),
+      x = NULL,
+      y = "Prediction Probability"
+    ) +
+    theme_pub(base_size = 14) +
+    theme(legend.position = "none")
+  
+  print(p_pred)
+}
+```
+
+```{r}
+#| label: prediction-table
+#| eval: !expr prediction_available
+
+if (prediction_available) {
+  pred_table <- tibble::tibble(
+    Metric = c("Predicted Class", "Ctrl Probability", "ALS Probability", "Confidence"),
+    Value = c(
+      pred_class,
+      sprintf("%.2f%%", pred_prob$Ctrl * 100),
+      sprintf("%.2f%%", pred_prob$ALS * 100),
+      sprintf("%.2f%%", max(pred_prob$Ctrl, pred_prob$ALS) * 100)
+    )
+  )
+  
+  knitr::kable(pred_table, caption = "Classification Prediction Results") %>%
+    kableExtra::kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+    kableExtra::row_spec(1, bold = TRUE, color = "white", background = pred_color)
+}
+```
+
+# Summary {#sec-summary}
+
+```{r}
+#| label: summary-table
+
+# Compile all key results
+summary_results <- tibble::tibble(
+  Category = c(
+    rep("Quality Control", 5),
+    rep("Fragment Analysis", 4),
+    rep("End Motifs", 2),
+    if (prediction_available) "Classification" else character(0)
+  ),
+  Metric = c(
+    "Total Reads", "Mapping Rate", "Bisulfite Conversion", "CpG Methylation", "Mean MAPQ",
+    "Median Fragment Length", "Mode Fragment Length", "Short/Long Ratio", "TSS Enrichment Score",
+    "Top Motif", "Motif Diversity (MDS)",
+    if (prediction_available) "Predicted Group" else character(0)
+  ),
+  Value = c(
+    format(summary_stats$total_reads, big.mark = ","),
+    sprintf("%.2f%%", summary_stats$mapping_rate * 100),
+    sprintf("%.2f%%", summary_stats$bisulfite_conversion * 100),
+    sprintf("%.2f%%", summary_stats$cpg_methylation * 100),
+    sprintf("%.1f", summary_stats$mean_mapq),
+    sprintf("%d bp", as.integer(summary_stats$median_frag_length)),
+    sprintf("%d bp", summary_stats$frag_mode),
+    sprintf("%.3f", short_long_ratio),
+    sprintf("%.2f", max(tss_profile$enrichment, na.rm = TRUE)),
+    as.character(top20_motifs$motif[1]),
+    sprintf("%.4f", mds),
+    if (prediction_available) sprintf("%s (%.1f%%)", pred_class, max(pred_prob) * 100) else character(0)
+  )
+)
+
+knitr::kable(summary_results, caption = paste("Analysis Summary for", SAMPLE_ID)) %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  kableExtra::pack_rows("Quality Control", 1, 5) %>%
+  kableExtra::pack_rows("Fragment Analysis", 6, 9) %>%
+  kableExtra::pack_rows("End Motifs", 10, 11) %>%
+  {if (prediction_available) kableExtra::pack_rows(., "Classification", 12, 12) else .}
+```
+
+# Methods {#sec-methods}
+
+## Data Processing
+
+The BAM file was processed using custom R functions that implement the following pipeline:
+
+1. **Read Filtering**: Reads were filtered to retain properly paired, non-duplicate alignments with MAPQ ≥ 30.
+2. **Fragment Extraction**: Fragment coordinates were derived from paired-end alignments using the union span of mate alignments.
+3. **GC Content**: Fragment GC content was calculated as (G+C)/(A+C+G+T) excluding N bases.
+4. **Methylation Extraction**: CpG methylation was extracted from Bismark XM tags or coverage files.
+
+## Fragmentation Analysis
+
+- **Insert Size Distribution**: Fragment lengths were computed from paired-end alignment coordinates.
+- **Short/Long Ratio**: Ratio of fragments 90-150 bp (short) to 151-220 bp (long).
+- **GC Correction**: LOESS regression was used to correct for GC bias in fragment counts.
+
+## End Motif Analysis
+
+- **Motif Extraction**: 4-mer sequences were extracted from both 5' ends of each fragment (strand-aware).
+- **Motif Diversity Score**: Calculated as normalized Shannon entropy: MDS = H(p) / log₂(256).
+
+## Classification
+
+- **Model**: Random Forest classifier trained on ALS vs Control cohort data.
+- **Features**: stackHMM-based regional methylation levels (100 chromatin states).
+- **Validation**: Nested cross-validation (LOOCV outer, 5-fold inner) with Boruta feature selection.
+
+## Software
+
+This analysis was performed using R version `r R.version.string` with Bioconductor packages for genomic analysis. All core algorithms are identical to those used in the cohort analysis to ensure reproducibility.
+
+---
+
+*Report generated on `r Sys.time()`*

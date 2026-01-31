@@ -443,7 +443,7 @@ ht_grob <- grid::grid.grabExpr(
 p_ht <- patchwork::wrap_elements(full = ht_grob)
 
 p_end_motif_combined <- (p_top20 | p_ht) / (p_mds | p_pca | p_volcano) +
-  plot_annotation(tag_levels = "A") +
+  patchwork::plot_annotation(tag_levels = "A") +
   plot_layout(heights = c(2.5, 1.6))
 
 ggsave(

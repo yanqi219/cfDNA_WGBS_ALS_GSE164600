@@ -1,0 +1,47 @@
+project:
+  type: website
+  output-dir: _site
+
+website:
+  title: "cfDNA WGBS Analysis: ALS vs Control"
+  navbar:
+    left:
+      - href: cfDNA_analysis_report.qmd
+        text: Analysis Report
+  page-footer:
+    center: "cfDNA WGBS Analysis Pipeline | GSE164600"
+
+format:
+  html:
+    theme:
+      light: flatly
+      dark: darkly
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-tools: true
+    code-line-numbers: true
+    code-copy: true
+    fig-width: 10
+    fig-height: 7
+    fig-dpi: 300
+    fig-format: png
+    highlight-style: github
+    self-contained: false
+
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: true
+  freeze: auto
+
+bibliography: references.bib
+csl: nature.csl
+
+knitr:
+  opts_chunk:
+    fig.path: "figures/"
+    fig.align: "center"
+    out.width: "100%"

@@ -1,0 +1,3 @@
+direction,n_DMRs,total,pct
+Hyper (ALS>Ctrl),448,823,54.4
+Hypo (ALS<Ctrl),375,823,45.6
