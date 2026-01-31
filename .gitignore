@@ -27,6 +27,9 @@ data/raw/*.bai
 *~
 .DS_Store
 
+# Prevent accidental re-adding of the >100MB uncompressed BED (use .bed.gz instead)
+data/processed/hg38_genome_100_segments.bed
+
 # Large outputs (optional - uncomment if needed)
 # data/processed/*.rds
 # results/figures/*.pdf
